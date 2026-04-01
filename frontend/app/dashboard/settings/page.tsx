@@ -58,7 +58,10 @@ export default function SettingsPage() {
     try {
       const token = await getToken();
       const res = await authenticatedFetch(`/api/accounts/oauth/${index}`, token);
-      if (!res.ok) throw new Error("Failed to get auth URL");
+      if (!res.ok) {
+        const body = await res.json().catch(() => ({}));
+        throw new Error(body.detail || "Failed to get auth URL");
+      }
       const data = await res.json();
       if (data.auth_url) window.location.href = data.auth_url;
       else throw new Error("No auth URL returned");
@@ -73,7 +76,10 @@ export default function SettingsPage() {
     try {
       const token = await getToken();
       const res = await authenticatedFetch("/api/accounts/oauth/new", token);
-      if (!res.ok) throw new Error("Failed to initiate connection");
+      if (!res.ok) {
+        const body = await res.json().catch(() => ({}));
+        throw new Error(body.detail || "Failed to initiate connection");
+      }
       const data = await res.json();
       if (data.auth_url) window.location.href = data.auth_url;
       else throw new Error("No auth URL returned");
@@ -85,12 +91,12 @@ export default function SettingsPage() {
   }
   async function handleRemoveCredentials() {
     confirm("Remove stored credentials?", async () => {
-      localStorage.removeItem("credentials");
-      toast("Credentials removed from browser. Please upload them again to continue using StitchDrive features.", "success");
-      // Optional: small delay and refresh to clear any state relying on old creds
+      const token = await getToken();
+      await authenticatedFetch("/api/credentials", token, { method: "DELETE" });
+      toast("Credentials removed successfully.", "success");
       setTimeout(() => window.location.reload(), 1500);
     }, { 
-      description: "This will delete the 'credentials.json' data stored in your browser's local storage. You will not be able to sync or manage files until you upload it again.",
+      description: "This will permanently delete your Google Cloud credentials from the server. You will need to re-upload them to use StitchDrive features.",
       confirmLabel: "Remove Credentials",
       danger: true 
     });
@@ -255,9 +261,9 @@ export default function SettingsPage() {
         <div className="absolute top-0 right-0 h-32 w-32 rounded-full bg-rose-500/5 blur-3xl pointer-events-none" />
         <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-4 relative z-10">
           <div>
-            <h2 className="text-sm font-semibold tracking-wide text-rose-400 uppercase mb-1">Local Credentials</h2>
+            <h2 className="text-sm font-semibold tracking-wide text-rose-400 uppercase mb-1">Stored Credentials</h2>
             <p className="text-xs font-medium text-sd-text3 max-w-md">
-              Remove the Google Cloud `credentials.json` data from your browser's local storage. You will need to re-upload it to perform any file operations.
+              Remove the Google Cloud `credentials.json` stored on the server. You will need to re-upload it to perform file operations.
             </p>
           </div>
           <button

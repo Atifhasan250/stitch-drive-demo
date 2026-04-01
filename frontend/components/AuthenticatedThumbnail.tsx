@@ -2,7 +2,7 @@
 
 import { useEffect, useState } from "react";
 import { useAuth } from "@clerk/nextjs";
-import { fetchMediaBlobUrl } from "@/lib/api";
+import { fetchThumbnailBlobUrl } from "@/lib/api";
 import { FileTypeIcon } from "./FileRow";
 
 export function AuthenticatedThumbnail({
@@ -20,18 +20,23 @@ export function AuthenticatedThumbnail({
   const [inView, setInView] = useState(false);
 
   useEffect(() => {
-    // Only fetch if it actually has a thumbnail and is in view
     if (!inView) return;
 
     let active = true;
-    let blobUrl = "";
+    let allocatedUrl = "";
 
     const loadThumb = async () => {
       try {
         const token = await getToken();
-        blobUrl = await fetchMediaBlobUrl(`/api/files/${fileId}/thumbnail`, token);
-        if (active) setUrl(blobUrl);
-      } catch (err) {
+        const nextUrl = await fetchThumbnailBlobUrl(fileId, token);
+        if (!active) {
+          URL.revokeObjectURL(nextUrl);
+          return;
+        }
+        allocatedUrl = nextUrl;
+        setUrl(nextUrl);
+        setError(false);
+      } catch {
         if (active) setError(true);
       }
     };
@@ -40,7 +45,7 @@ export function AuthenticatedThumbnail({
 
     return () => {
       active = false;
-      if (blobUrl) URL.revokeObjectURL(blobUrl);
+      if (allocatedUrl) URL.revokeObjectURL(allocatedUrl);
     };
   }, [fileId, getToken, inView]);
 

@@ -22,8 +22,10 @@ export function PreviewModal({ file, onClose }: { file: FileItem; onClose: () =>
       }
       try {
         const token = await getToken();
-        // Use the appropriate view endpoint on the backend
-        blobUrl = await fetchMediaBlobUrl(`/api/files/${file.id}/view`, token);
+        blobUrl = await fetchMediaBlobUrl(`/api/files/${file.id}/view`, token, {
+          accountIndex: file.account_index,
+          driveFileId: file.drive_file_id,
+        });
         if (active) {
           setAuthenticatedUrl(blobUrl);
           setLoading(false);

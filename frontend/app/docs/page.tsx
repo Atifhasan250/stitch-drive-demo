@@ -177,7 +177,7 @@ export default function DocsPage() {
                   <>Visit <a href="https://console.cloud.google.com" className="text-sd-accent font-bold hover:underline">Google Cloud Console</a> and create a project named <strong className="text-sd-text">StitchDrive</strong>.</>,
                   <>Enable the <strong className="text-sd-text">Google Drive API</strong> from the API Library.</>,
                   <>Configure the <strong className="text-sd-text">OAuth Consent Screen</strong> as "External" and add your Gmail accounts as **Test Users**.</>,
-                  <>Create an **OAuth Client ID** (Web App). Add <Code>http://localhost:8000/api/auth/callback</Code> as an **Authorized Redirect URI**.</>,
+                  <>Create an **OAuth Client ID** (Web App). Add <Code>http://localhost:8000/api/accounts/oauth/callback</Code> as an **Authorized Redirect URI**.</>,
                   <>Download the resulting JSON file. You will upload this in Step 07.</>,
                 ]} />
                 <Note type="tip">Adding accounts as Test Users prevents OAuth tokens from expiring every 7 days during development.</Note>
@@ -193,7 +193,7 @@ export default function DocsPage() {
                 <div className="grid gap-6 md:grid-cols-2">
                   <div className="space-y-3">
                     <p className="text-xs font-black uppercase text-sd-text3">backend/.env</p>
-                    <Block>{`MONGO_URI=mongodb://.../stitchdrive\nCLERK_SECRET_KEY=sk_test_...\nBACKEND_URL=http://localhost:8000\nFRONTEND_URL=http://localhost:3000`}</Block>
+                    <Block>{`MONGO_URI=mongodb://.../stitchdrive\nCLERK_SECRET_KEY=sk_test_...\nBACKEND_URL=http://localhost:8000\nFRONTEND_URL=http://localhost:3000\nSTATE_SECRET=your-random-secret\nENCRYPTION_KEY=your-base64-key`}</Block>
                   </div>
                   <div className="space-y-3">
                     <p className="text-xs font-black uppercase text-sd-text3">frontend/.env</p>
@@ -233,7 +233,7 @@ export default function DocsPage() {
                   <>You will be automatically prompted to **Upload Credentials**.</>,
                   <>Drag the JSON file you downloaded from Google Cloud (Step 03) into the box.</>,
                 ]} />
-                <Note type="tip">These credentials are stored in your browser's <strong className="text-sd-text">LocalStorage</strong> and passed securely to the backend for OAuth flows. They never leave your environment.</Note>
+                <Note type="tip">These credentials are encrypted and stored server-side for your signed-in account, so the raw client secret no longer lives in browser storage.</Note>
               </div>
             </section>
 

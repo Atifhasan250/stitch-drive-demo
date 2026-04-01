@@ -1,7 +1,7 @@
 import mongoose from "mongoose";
-import fetch from "node-fetch";
 import DriveAccount from "../models/DriveAccount.js";
 import File from "../models/File.js";
+import { fetchWithTimeout } from "../utils/fetchWithTimeout.js";
 import {
   getOAuth2Client,
   listSharedFiles,
@@ -24,6 +24,15 @@ import {
   reconcileAccountFiles,
 } from "../services/driveService.js";
 
+const SAFE_THUMBNAIL_HOSTS = [
+  "lh3.googleusercontent.com",
+  "lh4.googleusercontent.com",
+  "lh5.googleusercontent.com",
+  "lh6.googleusercontent.com",
+  "drive.google.com",
+  "docs.google.com",
+];
+
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
 function isValidObjectId(id) {
@@ -44,6 +53,27 @@ function fileToDict(f) {
   };
 }
 
+function isSafeThumbnailUrl(urlString) {
+  try {
+    const parsed = new URL(urlString);
+    if (parsed.protocol !== "https:") return false;
+    return SAFE_THUMBNAIL_HOSTS.some((host) =>
+      parsed.hostname === host || parsed.hostname.endsWith(`.${host}`)
+    );
+  } catch {
+    return false;
+  }
+}
+
+function isValidFileName(name) {
+  if (!name) return false;
+  if (name.length > 255) return false;
+  if (name === "." || name === "..") return false;
+  if (/[\/\\\0]/.test(name)) return false;
+  if (/[\u0000-\u001f]/.test(name)) return false;
+  return true;
+}
+
 // ── POST /api/files/sync ──────────────────────────────────────────────────────
 export async function syncFiles(req, res) {
   const ownerId = req.ownerId;
@@ -56,11 +86,25 @@ export async function syncFiles(req, res) {
 // ── GET /api/files ────────────────────────────────────────────────────────────
 export async function listFiles(req, res) {
   const ownerId = req.ownerId;
+  const page = Math.max(1, parseInt(req.query.page, 10) || 1);
+  const limit = Math.min(Math.max(1, parseInt(req.query.limit, 10) || 1000), 1000);
+  const skip = (page - 1) * limit;
   const connected = await DriveAccount.find({ ownerId, isConnected: true }).select("accountIndex").lean();
   const connectedIndices = connected.map((a) => a.accountIndex);
-  const files = await File.find({ ownerId, accountIndex: { $in: connectedIndices } })
-    .sort({ createdAt: -1 })
-    .lean();
+
+  const query = { ownerId, accountIndex: { $in: connectedIndices } };
+  const [files, total] = await Promise.all([
+    File.find(query)
+      .sort({ createdAt: -1 })
+      .skip(skip)
+      .limit(limit)
+      .lean(),
+    File.countDocuments(query),
+  ]);
+
+  res.setHeader("X-Total-Count", total);
+  res.setHeader("X-Page", page);
+  res.setHeader("X-Limit", limit);
   return res.json(files.map(fileToDict));
 }
 
@@ -88,7 +132,7 @@ export async function initiateUpload(req, res) {
     const metadata = { name: fileName };
     if (parentFolderId) metadata.parents = [parentFolderId];
 
-    const response = await fetch(
+    const response = await fetchWithTimeout(
       "https://www.googleapis.com/upload/drive/v3/files?uploadType=resumable",
       {
         method: "POST",
@@ -99,7 +143,8 @@ export async function initiateUpload(req, res) {
           "X-Upload-Content-Type": mimeType || "application/octet-stream",
         },
         body: JSON.stringify(metadata),
-      }
+      },
+      10_000
     );
 
     if (!response.ok) {
@@ -173,8 +218,12 @@ export async function getThumbnail(req, res) {
     return res.status(404).json({ detail: "Thumbnail not available" });
   }
 
+  if (!isSafeThumbnailUrl(file.thumbnailLink)) {
+    return res.status(400).json({ detail: "Unsafe thumbnail URL" });
+  }
+
   try {
-    const response = await fetch(file.thumbnailLink);
+    const response = await fetchWithTimeout(file.thumbnailLink, {}, 5000);
     if (!response.ok) throw new Error("Failed to fetch thumbnail from Google");
 
     const contentType = response.headers.get("content-type") || "image/jpeg";
@@ -266,6 +315,9 @@ export async function rename(req, res) {
   const newName = req.body.new_name?.trim();
   if (!newName) {
     return res.status(400).json({ detail: "new_name is required and cannot be empty" });
+  }
+  if (!isValidFileName(newName)) {
+    return res.status(400).json({ detail: "Invalid file name" });
   }
 
   const file = await File.findOne({ _id: req.params.fileId, ownerId });

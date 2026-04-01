@@ -14,28 +14,22 @@ export function CredentialsUpload() {
   const fileInputRef = useRef<HTMLInputElement>(null);
 
   useEffect(() => {
-    const saved = localStorage.getItem("credentials");
-    if (saved) {
-      validateStoredCredentials(saved);
-    }
+    checkStatus();
   }, []);
 
-  const validateStoredCredentials = async (credString: string) => {
+  const checkStatus = async () => {
     setStatus("checking");
     try {
       const token = await getToken();
-      const res = await authenticatedFetch("/api/accounts/verify-credentials", token, {
-        method: "POST"
-      });
-
+      const res = await authenticatedFetch("/api/credentials/status", token);
       if (res.ok) {
-        setStatus("valid");
+        const data = await res.json();
+        setStatus(data.hasCredentials ? "valid" : "none");
       } else {
-        setStatus("invalid");
+        setStatus("none");
       }
-    } catch (err) {
-      console.error("[Credentials] Validation failed:", err);
-      setStatus("invalid");
+    } catch {
+      setStatus("none");
     }
   };
 
@@ -54,19 +48,18 @@ export function CredentialsUpload() {
           throw new Error("Missing client_id or client_secret");
         }
 
-        // Store exactly what was uploaded, but the backend handles the mapping
-        const credString = JSON.stringify(json);
-        localStorage.setItem("credentials", credString);
-        await validateStoredCredentials(credString);
-      } catch (err) {
-        console.error("[Credentials] Invalid JSON file:", err);
+        const token = await getToken();
+        const res = await authenticatedFetch("/api/credentials/store", token, {
+          method: "POST",
+          body: JSON.stringify({ credentials: json }),
+        });
+
+        setStatus(res.ok ? "valid" : "invalid");
+      } catch {
         setStatus("invalid");
-        // Clear broken credentials
-        localStorage.removeItem("credentials");
       }
     };
     reader.readAsText(file);
-    // Reset input so the same file can be uploaded again if needed
     e.target.value = "";
   };
 
@@ -109,13 +102,13 @@ export function CredentialsUpload() {
               <path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4z" />
             </svg>
           ) : status === "valid" ? (
-            <div className="flex h-5 w-5 items-center justify-center rounded-full bg-emerald-500 text-white shadow-glow-sm">
+            <div className="flex h-5 w-5 items-center justify-center rounded-full bg-emerald-500 text-white">
               <svg className="h-3.5 w-3.5" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={3}>
                 <path strokeLinecap="round" strokeLinejoin="round" d="m4.5 12.75 6 6 9-13.5" />
               </svg>
             </div>
           ) : status === "invalid" ? (
-            <div className="flex h-5 w-5 items-center justify-center rounded-full bg-rose-500 text-white shadow-glow-sm">
+            <div className="flex h-5 w-5 items-center justify-center rounded-full bg-rose-500 text-white">
               <svg className="h-3.5 w-3.5" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={3}>
                 <path strokeLinecap="round" strokeLinejoin="round" d="M6 18 18 6M6 6l12 12" />
               </svg>
@@ -125,9 +118,9 @@ export function CredentialsUpload() {
 
         {/* Hover info for invalid state */}
         {isHovered && status === "invalid" && (
-          <div className="absolute top-full right-0 mt-2 w-64 rounded-xl border border-rose-500/20 bg-sd-s2 p-3 text-xs text-rose-400 shadow-xl z-50 animate-in fade-in slide-in-from-top-1">
+          <div className="absolute top-full right-0 z-50 mt-2 w-64 rounded-xl border border-rose-500/20 bg-sd-s2 p-3 text-xs text-rose-400 shadow-xl">
             <p className="font-semibold mb-1">Invalid Credentials</p>
-            <p className="text-sd-text3 leading-relaxed">The JSON file provided is either malformed or missing required Google Drive API fields (client_id, client_secret). Please try again.</p>
+            <p className="text-sd-text3 leading-relaxed">The JSON file is malformed or missing required fields.</p>
           </div>
         )}
       </button>

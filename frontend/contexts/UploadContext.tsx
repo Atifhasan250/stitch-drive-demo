@@ -95,14 +95,8 @@ export function UploadProvider({ children }: { children: React.ReactNode }) {
       const token = await getToken();
       
       // Step 1: Initiate upload session with backend
-        const creds = localStorage.getItem("credentials");
-        const initRes = await fetch("/api/files/upload/initiate", {
-          method: "POST",
-          headers: { 
-            "Content-Type": "application/json",
-            Authorization: `Bearer ${token}`,
-            ...(creds ? { "X-Credentials": creds } : {})
-          },
+      const initRes = await authenticatedFetch("/api/files/upload/initiate", token, {
+        method: "POST",
         body: JSON.stringify({
           fileName,
           mimeType: fileType,
@@ -183,7 +177,8 @@ export function UploadProvider({ children }: { children: React.ReactNode }) {
   const moveFile = useCallback(async (file: any, targetAccountIndex: number) => {
     const id = ++idRef.current;
     const fileName = file.file_name || file.name;
-    const creds = localStorage.getItem("credentials");
+    let targetDriveFileId = "";
+    let targetDbFileId = "";
     
     setIsManagerMinimized(false);
     setSnacks((s) => [...s, { id, name: `Preparing: ${fileName}`, progress: 0, status: "uploading" }]);
@@ -193,9 +188,7 @@ export function UploadProvider({ children }: { children: React.ReactNode }) {
 
       // Step 1: Get Source Token
       setSnacks((s) => s.map((sn) => (sn.id === id ? { ...sn, name: `[1/3] Downloading: ${fileName}` } : sn)));
-      const tokenRes = await fetch(`/api/accounts/${file.account_index}/token`, {
-        headers: { ...(creds ? { "X-Credentials": creds || "" } : {}) }
-      });
+      const tokenRes = await authenticatedFetch(`/api/accounts/${file.account_index}/token`, token);
       if (!tokenRes.ok) throw new Error("Source auth failed");
       const { accessToken } = await tokenRes.json();
 
@@ -212,13 +205,8 @@ export function UploadProvider({ children }: { children: React.ReactNode }) {
       setSnacks((s) => s.map((sn) => (sn.id === id ? { ...sn, progress: 30, name: `[2/3] Uploading: ${fileName}` } : sn)));
       const mimeType = file.mime_type || "application/octet-stream";
       
-      const initRes = await fetch("/api/files/upload/initiate", {
+      const initRes = await authenticatedFetch("/api/files/upload/initiate", token, {
         method: "POST",
-        headers: {
-          "Content-Type": "application/json",
-          Authorization: `Bearer ${token}`,
-          ...(creds ? { "X-Credentials": creds } : {})
-        },
         body: JSON.stringify({ fileName, mimeType, accountIndex: targetAccountIndex }),
       });
       if (!initRes.ok) throw new Error("Target upload initiation failed");
@@ -248,32 +236,51 @@ export function UploadProvider({ children }: { children: React.ReactNode }) {
       });
 
       const { driveFileId } = await uploadPromise;
+      targetDriveFileId = driveFileId;
 
       // Step 5: Finalize in DB
-      const finalRes = await fetch("/api/files/upload/finalize", {
+      const finalRes = await authenticatedFetch("/api/files/upload/finalize", token, {
         method: "POST",
-        headers: {
-          "Content-Type": "application/json",
-          Authorization: `Bearer ${token}`,
-          ...(creds ? { "X-Credentials": creds } : {})
-        },
         body: JSON.stringify({ driveFileId, accountIndex }),
       });
       if (!finalRes.ok) throw new Error("Failed to finalize moved file");
+      const finalizedFile = await finalRes.json();
+      targetDbFileId = finalizedFile.id;
 
       // Step 6: Delete from source account
       setSnacks((s) => s.map((sn) => (sn.id === id ? { ...sn, name: `[3/3] Deleting Source: ${fileName}`, progress: 95 } : sn)));
-      const deleteRes = await fetch(`/api/files/${file.id}`, {
-        method: "DELETE",
-        headers: { ...(creds ? { "X-Credentials": creds || "" } : {}) }
-      });
-      if (!deleteRes.ok) console.warn("[Move] Warning: File was moved but source couldn't be deleted.");
+      const deleteRes = await authenticatedFetch(`/api/files/${file.id}`, token, { method: "DELETE" });
+      if (!deleteRes.ok) {
+        throw new Error("Source delete failed after upload");
+      }
 
       setSnacks((s) => s.map((sn) => (sn.id === id ? { ...sn, status: "done", progress: 100, name: `Moved: ${fileName}` } : sn)));
       listeners.current.forEach((fn) => fn());
       
     } catch (err: any) {
       console.error("[Move] Progress Error:", err.message);
+
+      if (targetDbFileId) {
+        try {
+          await authenticatedFetch(`/api/files/${targetDbFileId}`, await getToken(), { method: "DELETE" });
+        } catch (rollbackErr) {
+          console.error("[Move] Rollback via API failed:", rollbackErr);
+        }
+      } else if (targetDriveFileId) {
+        try {
+          const rollbackTokenRes = await authenticatedFetch(`/api/accounts/${targetAccountIndex}/token`, await getToken());
+          if (rollbackTokenRes.ok) {
+            const { accessToken } = await rollbackTokenRes.json();
+            await fetch(`https://www.googleapis.com/drive/v3/files/${targetDriveFileId}`, {
+              method: "DELETE",
+              headers: { Authorization: `Bearer ${accessToken}` },
+            });
+          }
+        } catch (rollbackErr) {
+          console.error("[Move] Direct rollback failed:", rollbackErr);
+        }
+      }
+
       setSnacks((s) => s.map((sn) => (sn.id === id ? { ...sn, status: "error", name: `Move Failed: ${fileName}` } : sn)));
     }
   }, [getToken]);
@@ -289,11 +296,8 @@ export function UploadProvider({ children }: { children: React.ReactNode }) {
     function onDragLeave(e: DragEvent) {
       const types = Array.from(e.dataTransfer?.types || []);
       if (!types.includes("Files")) return;
-      dragCounter.current--;
-      if (dragCounter.current <= 0) {
-        dragCounter.current = 0;
-        setDragging(false);
-      }
+      dragCounter.current = Math.max(0, dragCounter.current - 1);
+      if (dragCounter.current === 0) setDragging(false);
     }
     function onDragOver(e: DragEvent) {
       const types = Array.from(e.dataTransfer?.types || []);
@@ -308,17 +312,22 @@ export function UploadProvider({ children }: { children: React.ReactNode }) {
       setDragging(false);
       Array.from(e.dataTransfer?.files ?? []).forEach((f) => upload(f));
     }
+    function onWindowBlur() {
+      dragCounter.current = 0;
+      setDragging(false);
+    }
 
     window.addEventListener("dragenter", onDragEnter);
     window.addEventListener("dragleave", onDragLeave);
-
     window.addEventListener("dragover", onDragOver);
     window.addEventListener("drop", onDrop);
+    window.addEventListener("blur", onWindowBlur);
     return () => {
       window.removeEventListener("dragenter", onDragEnter);
       window.removeEventListener("dragleave", onDragLeave);
       window.removeEventListener("dragover", onDragOver);
       window.removeEventListener("drop", onDrop);
+      window.removeEventListener("blur", onWindowBlur);
     };
   }, [upload]);
 

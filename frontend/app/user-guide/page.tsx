@@ -134,7 +134,7 @@ export default function UserGuidePage() {
                 <ul className="text-sm text-sd-text2 pl-6 space-y-2 list-disc list-inside">
                   <li>Go to **Credentials** &rarr; **Create Credentials** &rarr; **OAuth Client ID**.</li>
                   <li>Application type: **Web Application**.</li>
-                  <li>In **Authorized Redirect URIs**, paste exactly: <Code>http://localhost:8000/api/auth/callback</Code></li>
+                  <li>In **Authorized Redirect URIs**, paste exactly: <Code>http://localhost:8000/api/accounts/oauth/callback</Code></li>
                 </ul>
               </div>
 
@@ -179,7 +179,7 @@ export default function UserGuidePage() {
               <p className="text-xs font-bold text-sd-text3 uppercase">Drag & Drop your <span className="text-sd-text">credentials.json</span> here</p>
             </div>
             <Note type="tip">
-              This initialization only happens once! These keys are stored safely in your own browser's memory.
+              This initialization only happens once. The uploaded credentials are encrypted and stored server-side for your account.
             </Note>
           </Card>
         </section>

@@ -106,7 +106,10 @@ export default function SharedPage() {
     try {
       const token = await getToken();
       const path = `/api/files/shared/${file.account_index}/${file.drive_file_id}/download`; // Shared preview is basically same as download stream
-      const url = await fetchMediaBlobUrl(path, token);
+      const url = await fetchMediaBlobUrl(path, token, {
+        accountIndex: file.account_index,
+        driveFileId: file.drive_file_id,
+      });
       window.open(url, "_blank");
     } catch (err: any) {
       alert("Preview failed: " + err.message);

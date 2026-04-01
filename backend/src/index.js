@@ -5,6 +5,7 @@ import cookieParser from "cookie-parser";
 import cors from "cors";
 import helmet from "helmet";
 import morgan from "morgan";
+import mongoose from "mongoose";
 import { clerkMiddleware } from "@clerk/express";
 
 import { connectDB } from "./db/index.js";
@@ -14,6 +15,7 @@ import { FRONTEND_URL } from "./config/index.js";
 
 
 import accountsRoutes from "./routes/accounts.js";
+import credentialsRoutes from "./routes/credentials.js";
 import filesRoutes from "./routes/files.js";
 import profileRoutes from "./routes/profile.js";
 import { errorHandler } from "./middlewares/errorHandler.js";
@@ -33,9 +35,10 @@ app.use(morgan(IS_PROD ? "combined" : "dev"));
 const allowedOrigins = [
   ...new Set([
     "http://localhost:3000",
-    "http://192.168.137.1:3000",
-    "https://atifs-drive.vercel.app",
     FRONTEND_URL,
+    ...(process.env.EXTRA_ALLOWED_ORIGINS
+      ? process.env.EXTRA_ALLOWED_ORIGINS.split(",").map((origin) => origin.trim())
+      : []),
   ].filter(Boolean)),
 ];
 
@@ -48,7 +51,7 @@ app.use(
     },
     credentials: true,
     methods: ["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
-    allowedHeaders: ["Content-Type", "Authorization", "X-Credentials"],
+    allowedHeaders: ["Content-Type", "Authorization"],
   })
 );
 
@@ -63,11 +66,24 @@ app.use(clerkMiddleware());
 // ── Routes ────────────────────────────────────────────────────────────────────
 
 app.use("/api/accounts", accountsRoutes);
+app.use("/api/credentials", credentialsRoutes);
 app.use("/api/files", filesRoutes);
 app.use("/api/profile", profileRoutes);
 
 // ── Health check ──────────────────────────────────────────────────────────────
 app.get("/", (req, res) => res.json({ message: "StitchDrive API is running", status: "active" }));
+app.get("/health", async (req, res) => {
+  const dbState = mongoose.connection.readyState;
+  const dbHealthy = dbState === 1;
+  const status = dbHealthy ? 200 : 503;
+
+  return res.status(status).json({
+    status: dbHealthy ? "healthy" : "degraded",
+    db: ["disconnected", "connected", "connecting", "disconnecting"][dbState] || "unknown",
+    uptime: Math.floor(process.uptime()),
+    timestamp: new Date().toISOString(),
+  });
+});
 app.get("/active", (req, res) => res.json({ status: "active" }));
 
 // ── Global error handler (must be last) ──────────────────────────────────────

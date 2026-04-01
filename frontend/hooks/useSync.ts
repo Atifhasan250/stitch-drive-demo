@@ -1,12 +1,19 @@
 import { useAuth } from "@clerk/nextjs";
-import { useCallback, useState, useEffect } from "react";
+import { useCallback, useState, useEffect, useRef } from "react";
 import { authenticatedFetch } from "@/lib/api";
+
+const AUTO_SYNC_INTERVAL_MS = 30 * 60_000;
+const SYNC_COOLDOWN_MS = 30 * 60_000;
+const SYNC_LOCK_TTL_MS = 5 * 60_000;
+const SYNC_LAST_RUN_KEY = "stitchdrive:last-sync-at";
+const SYNC_LOCK_KEY = "stitchdrive:sync-lock";
 
 export function useSync() {
   const { getToken } = useAuth();
   const [isSyncing, setIsSyncing] = useState(false);
   const [syncError, setSyncError] = useState<string | null>(null);
   const [lastSyncTime, setLastSyncTime] = useState<number | null>(null);
+  const tabIdRef = useRef(`tab_${Math.random().toString(36).slice(2)}`);
 
   const fetchWithRetry = async (
     url: string, 
@@ -84,13 +91,47 @@ export function useSync() {
     }
   };
 
-  const syncAll = useCallback(async () => {
+  const syncAll = useCallback(async (mode: "manual" | "auto" = "manual") => {
     if (isSyncing) return;
+    if (typeof window !== "undefined") {
+      if (!navigator.onLine) return;
+      if (mode === "auto" && document.visibilityState !== "visible") return;
+    }
+
+    const clerkToken = await getToken();
+    if (!clerkToken) return;
+
+    let lockAcquired = false;
+    if (typeof window !== "undefined") {
+      if (mode === "auto") {
+        const lastRun = Number(window.localStorage.getItem(SYNC_LAST_RUN_KEY) || "0");
+        if (Date.now() - lastRun < SYNC_COOLDOWN_MS) return;
+      }
+
+      try {
+        const rawLock = window.localStorage.getItem(SYNC_LOCK_KEY);
+        const currentLock = rawLock ? JSON.parse(rawLock) : null;
+        const now = Date.now();
+        const lockExpired = !currentLock || now - currentLock.timestamp > SYNC_LOCK_TTL_MS;
+
+        if (lockExpired || currentLock.tabId === tabIdRef.current) {
+          window.localStorage.setItem(
+            SYNC_LOCK_KEY,
+            JSON.stringify({ tabId: tabIdRef.current, timestamp: now })
+          );
+          lockAcquired = true;
+        } else if (mode === "auto") {
+          return;
+        }
+      } catch {
+        lockAcquired = true;
+      }
+    }
+
     setIsSyncing(true);
     setSyncError(null);
 
     try {
-      const clerkToken = await getToken();
       const accountsRes = await authenticatedFetch("/api/accounts", clerkToken);
       if (!accountsRes.ok) throw new Error("Failed to fetch accounts list");
       const accounts = await accountsRes.json();
@@ -100,7 +141,11 @@ export function useSync() {
         await syncAccount(account.account_index);
       }
       
-      setLastSyncTime(Date.now());
+      const completedAt = Date.now();
+      setLastSyncTime(completedAt);
+      if (typeof window !== "undefined") {
+        window.localStorage.setItem(SYNC_LAST_RUN_KEY, String(completedAt));
+      }
     } catch (err: any) {
       console.error("[Sync] Error:", err);
       let msg = err.message || "Synchronization failed";
@@ -109,17 +154,34 @@ export function useSync() {
       }
       setSyncError(msg);
     } finally {
+      if (typeof window !== "undefined" && lockAcquired) {
+        try {
+          const rawLock = window.localStorage.getItem(SYNC_LOCK_KEY);
+          const currentLock = rawLock ? JSON.parse(rawLock) : null;
+          if (!currentLock || currentLock.tabId === tabIdRef.current) {
+            window.localStorage.removeItem(SYNC_LOCK_KEY);
+          }
+        } catch {
+          window.localStorage.removeItem(SYNC_LOCK_KEY);
+        }
+      }
       setIsSyncing(false);
     }
-  }, [getToken]);
+  }, [getToken, isSyncing]);
+
+  const syncAllRef = useRef(syncAll);
+
+  useEffect(() => {
+    syncAllRef.current = syncAll;
+  }, [syncAll]);
 
   useEffect(() => {
     const interval = setInterval(() => {
-      syncAll();
-    }, 5 * 60_000); // Every 5 minutes
+      syncAllRef.current("auto");
+    }, AUTO_SYNC_INTERVAL_MS);
 
     return () => clearInterval(interval);
-  }, [syncAll]);
+  }, []);
 
   return { syncAll, isSyncing, syncError, lastSyncTime };
 }

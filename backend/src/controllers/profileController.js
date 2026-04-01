@@ -21,6 +21,8 @@ export async function getProfile(req, res) {
     display_name: profile.displayName,
     bio: profile.bio,
     has_avatar: profile.avatarDriveFileId != null,
+    avatar_drive_file_id: profile.avatarDriveFileId || null,
+    avatar_account_index: profile.avatarAccountIndex ?? null,
   });
 }
 

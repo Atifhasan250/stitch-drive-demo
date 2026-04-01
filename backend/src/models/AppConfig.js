@@ -10,7 +10,11 @@ const appConfigSchema = new mongoose.Schema(
 
 appConfigSchema.statics.getConfig = async function (key) {
   const doc = await this.findOne({ key });
-  if (!doc) throw new Error(`Config key '${key}' missing. Run: node scripts/generate_secrets.js`);
+  if (!doc) {
+    throw new Error(
+      `Config key '${key}' missing. Set ENCRYPTION_KEY in the environment or run: node scripts/generate_secrets.js`
+    );
+  }
   return doc.value;
 };
 

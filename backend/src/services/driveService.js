@@ -4,6 +4,7 @@ import DriveAccount from "../models/DriveAccount.js";
 import File from "../models/File.js";
 import { decryptToken } from "./authService.js";
 import * as config from "../config/index.js";
+import { BoundedTTLCache } from "../utils/BoundedTTLCache.js";
 
 const SCOPES = ["https://www.googleapis.com/auth/drive"];
 const PROFILE_FOLDER_NAME = "_StitchDrive_";
@@ -23,6 +24,12 @@ export function loadClientConfig(credentials = null) {
 // One client per account per user. Using a basic cache to avoid expensive 
 // decryption on every single request (like thumbnails).
 const _oauth2Cache = new Map(); // `${ownerId}_${accountIndex}` → { client, hash }
+
+const _oauth2CacheStore = new BoundedTTLCache(500, 30 * 60_000);
+_oauth2Cache.get = _oauth2CacheStore.get.bind(_oauth2CacheStore);
+_oauth2Cache.set = _oauth2CacheStore.set.bind(_oauth2CacheStore);
+_oauth2Cache.delete = _oauth2CacheStore.delete.bind(_oauth2CacheStore);
+_oauth2Cache.clear = _oauth2CacheStore.clear.bind(_oauth2CacheStore);
 
 export function getOAuth2Client(account, credentials = null) {
   const cacheKey = `${account.ownerId}_${account.accountIndex}`;
@@ -60,14 +67,18 @@ export function invalidateOAuth2Cache(ownerId, accountIndex) {
 const QUOTA_CACHE_TTL_MS = 5 * 60_000;
 const _quotaCache = new Map(); // `${ownerId}_${accountIndex}` → { data, expiresAt }
 
+const _quotaCacheStore = new BoundedTTLCache(500, QUOTA_CACHE_TTL_MS);
+_quotaCache.get = _quotaCacheStore.get.bind(_quotaCacheStore);
+_quotaCache.set = _quotaCacheStore.set.bind(_quotaCacheStore);
+_quotaCache.delete = _quotaCacheStore.delete.bind(_quotaCacheStore);
+_quotaCache.clear = _quotaCacheStore.clear.bind(_quotaCacheStore);
+
 function getCachedQuota(ownerId, accountIndex) {
-  const entry = _quotaCache.get(`${ownerId}_${accountIndex}`);
-  if (entry && Date.now() < entry.expiresAt) return entry.data;
-  return null;
+  return _quotaCache.get(`${ownerId}_${accountIndex}`) ?? null;
 }
 
 function setCachedQuota(ownerId, accountIndex, data) {
-  _quotaCache.set(`${ownerId}_${accountIndex}`, { data, expiresAt: Date.now() + QUOTA_CACHE_TTL_MS });
+  _quotaCache.set(`${ownerId}_${accountIndex}`, data);
 }
 
 export function invalidateQuotaCache(ownerId, accountIndex) {

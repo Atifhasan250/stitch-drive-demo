@@ -2,12 +2,14 @@
 
 import Link from "next/link";
 import { useEffect, useState } from "react";
+import { useAuth } from "@clerk/nextjs";
 import { useFiles } from "@/hooks/useFiles";
 import { useStorage } from "@/hooks/useStorage";
 import { formatBytes } from "@/lib/utils";
 import { type CachedStats, computeStats, getCachedStats, isStatsDirty, setCachedStats } from "@/hooks/useStats";
 import { CredentialsUpload } from "@/components/CredentialsUpload";
 import { AuthenticatedThumbnail } from "@/components/AuthenticatedThumbnail";
+import { authenticatedFetch } from "@/lib/api";
 
 type Account = {
   account_index: number;
@@ -87,6 +89,7 @@ function FileTypeIcon({ mimeType }: { mimeType: string | null }) {
 }
 
 export default function OverviewPage() {
+  const { getToken } = useAuth();
   const { accounts } = useStorage();
   const { files } = useFiles();
   const [stats, setStats] = useState<CachedStats | null>(null);
@@ -94,15 +97,20 @@ export default function OverviewPage() {
   const [hasCredentials, setHasCredentials] = useState<boolean | null>(null);
 
   useEffect(() => {
-    const checkCreds = () => {
-      const saved = localStorage.getItem("credentials");
-      setHasCredentials(!!saved);
+    const checkCreds = async () => {
+      try {
+        const token = await getToken();
+        const res = await authenticatedFetch("/api/credentials/status", token);
+        if (res.ok) {
+          const data = await res.json();
+          setHasCredentials(data.hasCredentials);
+        }
+      } catch {
+        setHasCredentials(false);
+      }
     };
     checkCreds();
-    // Listen for storage changes in other tabs
-    window.addEventListener("storage", checkCreds);
-    return () => window.removeEventListener("storage", checkCreds);
-  }, []);
+  }, [getToken]);
 
   useEffect(() => {
     if (files.length === 0 && accounts.length === 0) return;
@@ -169,7 +177,7 @@ export default function OverviewPage() {
             </div>
             <div className="flex-1 min-w-0">
               <h3 className="text-sm font-bold text-sd-text">Google Drive Credentials Required</h3>
-              <p className="mt-1 text-sm text-sd-text2 font-medium">Please upload your <code className="text-rose-400 font-mono">credentials.json</code> file to enable cloud storage features. This data is stored locally in your browser and never leaves your device.</p>
+              <p className="mt-1 text-sm text-sd-text2 font-medium">Please upload your <code className="text-rose-400 font-mono">credentials.json</code> file to enable cloud storage features.</p>
             </div>
           </div>
         </div>

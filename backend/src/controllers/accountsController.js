@@ -1,7 +1,8 @@
+import crypto from "crypto";
 import { google } from "googleapis";
 import DriveAccount from "../models/DriveAccount.js";
 import File from "../models/File.js";
-import { encryptToken, decryptToken } from "../services/authService.js";
+import { encryptToken } from "../services/authService.js";
 import {
   getAllQuotas,
   invalidateOAuth2Cache,
@@ -13,6 +14,56 @@ import {
   loadClientConfig,
 } from "../services/driveService.js";
 import * as config from "../config/index.js";
+import { getDecryptedCredentials } from "./credentialsController.js";
+
+const OAUTH_STATE_TTL_MS = 10 * 60_000;
+
+function getStateSecret() {
+  if (!config.STATE_SECRET) {
+    throw new Error("STATE_SECRET is not configured");
+  }
+  return config.STATE_SECRET;
+}
+
+function createSignedOAuthState(ownerId, accountIndex) {
+  const payload = Buffer.from(
+    JSON.stringify({ ownerId, accountIndex, issuedAt: Date.now() })
+  ).toString("base64url");
+  const signature = crypto
+    .createHmac("sha256", getStateSecret())
+    .update(payload)
+    .digest("base64url");
+
+  return `${payload}.${signature}`;
+}
+
+function parseSignedOAuthState(state) {
+  if (typeof state !== "string") return null;
+
+  const [payload, signature] = state.split(".");
+  if (!payload || !signature) return null;
+
+  const expected = crypto.createHmac("sha256", getStateSecret()).update(payload).digest();
+  const actual = Buffer.from(signature, "base64url");
+  if (expected.length !== actual.length || !crypto.timingSafeEqual(expected, actual)) {
+    return null;
+  }
+
+  const parsed = JSON.parse(Buffer.from(payload, "base64url").toString("utf-8"));
+  if (
+    typeof parsed?.ownerId !== "string" ||
+    typeof parsed?.accountIndex !== "number" ||
+    typeof parsed?.issuedAt !== "number"
+  ) {
+    return null;
+  }
+
+  if (Date.now() - parsed.issuedAt > OAUTH_STATE_TTL_MS) {
+    return null;
+  }
+
+  return parsed;
+}
 
 // ── GET /api/accounts ─────────────────────────────────────────────────────────
 export async function listAccounts(req, res) {
@@ -127,16 +178,8 @@ export async function getNewOAuthUrl(req, res) {
   const redirectUri = config.BACKEND_URL.replace(/\/$/, "") + "/api/accounts/oauth/callback";
   const oauth2Client = getOAuthFlow(redirectUri, req.clientCredentials);
   
-  // Encode ownerId and accountIndex in the state
-  const state = Buffer.from(JSON.stringify({ ownerId, accountIndex: newIndex })).toString("base64");
+  const state = createSignedOAuthState(ownerId, newIndex);
   const authUrl = getAuthUrl(oauth2Client, state);
-  if (req.headers["x-credentials"]) {
-    const account = await DriveAccount.findOne({ ownerId, accountIndex: newIndex });
-    if (account) {
-      account.tempCredentials = encryptToken(req.headers["x-credentials"]);
-      await account.save();
-    }
-  }
 
   return res.json({ auth_url: authUrl });
 }
@@ -153,15 +196,8 @@ export async function getOAuthUrl(req, res) {
   const redirectUri = config.BACKEND_URL.replace(/\/$/, "") + "/api/accounts/oauth/callback";
   const oauth2Client = getOAuthFlow(redirectUri, req.clientCredentials);
   
-  const state = Buffer.from(JSON.stringify({ ownerId, accountIndex })).toString("base64");
+  const state = createSignedOAuthState(ownerId, accountIndex);
   const authUrl = getAuthUrl(oauth2Client, state);
-  if (req.headers["x-credentials"]) {
-    const account = await DriveAccount.findOne({ ownerId, accountIndex });
-    if (account) {
-      account.tempCredentials = encryptToken(req.headers["x-credentials"]);
-      await account.save();
-    }
-  }
   
   return res.json({ auth_url: authUrl });
 }
@@ -181,8 +217,12 @@ export async function oauthCallback(req, res) {
 
   let stateObj;
   try {
-    stateObj = JSON.parse(Buffer.from(state, "base64").toString("utf-8"));
-  } catch (err) {
+    stateObj = parseSignedOAuthState(state);
+  } catch {
+    stateObj = null;
+  }
+
+  if (!stateObj) {
     return res.redirect(`${config.FRONTEND_URL}/dashboard/settings?error=oauth_invalid`);
   }
 
@@ -194,12 +234,16 @@ export async function oauthCallback(req, res) {
   }
 
   try {
-    let account = await DriveAccount.findOne({ ownerId, accountIndex });
-    if (!account || !account.tempCredentials) {
-      throw new Error("Temporary credentials not found in database. The connection session may have expired.");
+    const account = await DriveAccount.findOne({ ownerId, accountIndex });
+    if (!account) {
+      throw new Error("Account slot not found");
     }
 
-    const clientCredentials = JSON.parse(decryptToken(account.tempCredentials));
+    const clientCredentials = await getDecryptedCredentials(ownerId);
+    if (!clientCredentials) {
+      throw new Error("Stored credentials not found for this user");
+    }
+
     const redirectUri = config.BACKEND_URL.replace(/\/$/, "") + "/api/accounts/oauth/callback";
     const oauth2Client = getOAuthFlow(redirectUri, clientCredentials);
     const { tokens } = await oauth2Client.getToken(code);
@@ -235,7 +279,6 @@ export async function oauthCallback(req, res) {
       account.refreshToken = encryptToken(tokens.refresh_token);
     }
 
-    account.tempCredentials = null;
     await account.save();
 
     // Sync in the background for this user
@@ -257,9 +300,9 @@ export async function oauthCallback(req, res) {
 
 // ── POST /api/accounts/verify-credentials ────────────────────────────────────
 export async function verifyCredentials(req, res) {
-  const creds = req.clientCredentials;
+  const creds = req.body?.credentials || req.clientCredentials;
   if (!creds) {
-    return res.status(400).json({ detail: "No credentials provided in X-Credentials header" });
+    return res.status(400).json({ detail: "No credentials provided" });
   }
 
   try {

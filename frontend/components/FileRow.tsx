@@ -99,7 +99,10 @@ export default function FileRow({
   async function handleDownload() {
     try {
       const token = await getToken();
-      await downloadFileAuthenticated(file.id, file.file_name, token);
+      await downloadFileAuthenticated(file.id, file.file_name, token, {
+        accountIndex: file.account_index,
+        driveFileId: file.drive_file_id,
+      });
     } catch (err: any) {
       alert("Download failed: " + err.message);
     }
@@ -108,7 +111,10 @@ export default function FileRow({
   async function handlePreview() {
     try {
       const token = await getToken();
-      const url = await fetchMediaBlobUrl(`/api/files/${file.id}/view`, token);
+      const url = await fetchMediaBlobUrl(`/api/files/${file.id}/view`, token, {
+        accountIndex: file.account_index,
+        driveFileId: file.drive_file_id,
+      });
       window.open(url, "_blank");
       // Note: We're opening in a new tab, so we can't easily revoke the URL here without breaking the tab.
       // In a real app, we'd use a modal previewer.
@@ -122,7 +128,10 @@ export default function FileRow({
       <td className="px-4 py-3">
         <div className="flex items-center gap-3">
           {file.has_thumbnail ? (
-            <AuthenticatedThumbnail fileId={file.id} mimeType={file.mime_type} />
+            <AuthenticatedThumbnail
+              fileId={file.id}
+              mimeType={file.mime_type}
+            />
           ) : (
             <FileTypeIcon mimeType={file.mime_type} />
           )}

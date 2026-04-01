@@ -1,6 +1,7 @@
 import { Router } from "express";
 import { requireAuth } from "../middlewares/auth.js";
 import { loginLimiter } from "../middlewares/loginLimiter.js";
+import { apiLimiter } from "../middlewares/rateLimiters.js";
 import { 
   listAccounts, 
   disconnectAccount, 
@@ -19,9 +20,10 @@ router.get("/oauth/callback", loginLimiter, oauthCallback);
 router.get("/oauth/:accountIndex", requireAuth, loginLimiter, getOAuthUrl);
 
 // Base account management
-router.get("/", requireAuth, listAccounts);
-router.get("/:accountIndex/token", requireAuth, getAccessToken);
-router.post("/verify-credentials", requireAuth, verifyCredentialsService);
-router.delete("/:accountIndex", requireAuth, disconnectAccount);
+router.use(requireAuth, apiLimiter);
+router.get("/", listAccounts);
+router.get("/:accountIndex/token", getAccessToken);
+router.post("/verify-credentials", verifyCredentialsService);
+router.delete("/:accountIndex", disconnectAccount);
 
 export default router;

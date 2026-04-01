@@ -1,5 +1,6 @@
 import { Router } from "express";
 import { requireAuth } from "../middlewares/auth.js";
+import { apiLimiter, downloadLimiter, uploadLimiter } from "../middlewares/rateLimiters.js";
 import {
   syncFiles,
   listFiles,
@@ -26,36 +27,38 @@ import {
 
 const router = Router();
 
+router.use(requireAuth, apiLimiter);
+
 // ── Static paths first (must come before /:fileId routes) ────────────────────
-router.post("/sync", requireAuth, syncFiles);
-router.post("/cleanup", requireAuth, cleanupFiles);
-router.post("/reconcile", requireAuth, reconcileFiles);
-router.get("/shared", requireAuth, listShared);
-router.get("/trash", requireAuth, listTrash);
+router.post("/sync", syncFiles);
+router.post("/cleanup", cleanupFiles);
+router.post("/reconcile", reconcileFiles);
+router.get("/shared", listShared);
+router.get("/trash", listTrash);
 
 // ── Shared-file sub-routes ────────────────────────────────────────────────────
-router.get("/shared/:accountIndex/:folderId/children", requireAuth, listSharedChildren);
-router.get("/shared/:accountIndex/:driveFileId/download", requireAuth, downloadSharedFile);
-router.delete("/shared/:accountIndex/:driveFileId", requireAuth, deleteSharedFile);
+router.get("/shared/:accountIndex/:folderId/children", listSharedChildren);
+router.get("/shared/:accountIndex/:driveFileId/download", downloadLimiter, downloadSharedFile);
+router.delete("/shared/:accountIndex/:driveFileId", deleteSharedFile);
 
 // ── Trash sub-routes ──────────────────────────────────────────────────────────
-router.post("/trash/:accountIndex/:driveFileId/restore", requireAuth, restoreTrashFile);
-router.delete("/trash/:accountIndex/:driveFileId", requireAuth, deleteTrashFile);
+router.post("/trash/:accountIndex/:driveFileId/restore", restoreTrashFile);
+router.delete("/trash/:accountIndex/:driveFileId", deleteTrashFile);
 
 // ── Core file routes ──────────────────────────────────────────────────────────
-router.get("/", requireAuth, listFiles);
-router.post("/upload/initiate", requireAuth, initiateUpload);
-router.post("/upload/finalize", requireAuth, finalizeUpload);
-router.get("/:fileId/download", requireAuth, getDownload);
-router.post("/:fileId/download", requireAuth, getDownload);
-router.get("/:fileId/view", requireAuth, getView);
-router.post("/:fileId/view", requireAuth, getView);
-router.get("/:fileId/thumbnail", requireAuth, getThumbnail);
-router.post("/:fileId/thumbnail", requireAuth, getThumbnail);
-router.patch("/:fileId/rename", requireAuth, rename);
-router.patch("/:fileId/move", requireAuth, moveFileRoute);
-router.post("/:fileId/share", requireAuth, shareFileRoute);
-router.delete("/:fileId/share", requireAuth, unshareFileRoute);
-router.delete("/:fileId", requireAuth, deleteFile);
+router.get("/", listFiles);
+router.post("/upload/initiate", uploadLimiter, initiateUpload);
+router.post("/upload/finalize", uploadLimiter, finalizeUpload);
+router.get("/:fileId/download", downloadLimiter, getDownload);
+router.post("/:fileId/download", downloadLimiter, getDownload);
+router.get("/:fileId/view", downloadLimiter, getView);
+router.post("/:fileId/view", downloadLimiter, getView);
+router.get("/:fileId/thumbnail", getThumbnail);
+router.post("/:fileId/thumbnail", getThumbnail);
+router.patch("/:fileId/rename", rename);
+router.patch("/:fileId/move", moveFileRoute);
+router.post("/:fileId/share", shareFileRoute);
+router.delete("/:fileId/share", unshareFileRoute);
+router.delete("/:fileId", deleteFile);
 
 export default router;

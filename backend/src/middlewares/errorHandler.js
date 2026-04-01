@@ -1,5 +1,7 @@
 import multer from "multer";
 
+const IS_PROD = process.env.NODE_ENV === "production";
+
 export function errorHandler(err, req, res, next) {
   // Multer file size limit exceeded
   if (err instanceof multer.MulterError) {
@@ -29,7 +31,20 @@ export function errorHandler(err, req, res, next) {
     return res.status(400).json({ detail: err.message });
   }
 
-  console.error("[Error]", err.message || err);
   const status = err.status || err.statusCode || 500;
-  res.status(status).json({ detail: err.message || "Internal server error" });
+  const detail = IS_PROD && status >= 500
+    ? "An internal error occurred. Please try again."
+    : (err.message || "Internal server error");
+
+  if (status >= 500) {
+    console.error("[Error]", {
+      method: req.method,
+      path: req.path,
+      status,
+      message: err.message,
+      stack: IS_PROD ? undefined : err.stack,
+    });
+  }
+
+  res.status(status).json({ detail });
 }

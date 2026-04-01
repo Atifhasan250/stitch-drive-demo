@@ -4,18 +4,31 @@ import { useEffect, useRef, useState, useCallback } from "react";
 import { useRouter } from "next/navigation";
 import { useTheme } from "@/contexts/ThemeContext";
 import { useClerk, useUser, useAuth } from "@clerk/nextjs";
-import { authenticatedFetch } from "@/lib/api";
+import { authenticatedFetch, fetchMediaBlobUrl } from "@/lib/api";
 
-type ProfileData = { display_name: string | null; bio: string | null; has_avatar: boolean };
+type ProfileData = {
+  display_name: string | null;
+  bio: string | null;
+  has_avatar: boolean;
+  avatar_drive_file_id: string | null;
+  avatar_account_index: number | null;
+};
 
 export default function Navbar({ onMenuOpen }: { onMenuOpen?: () => void }) {
   const router = useRouter();
   const { signOut } = useClerk();
   const { user } = useUser();
   const { theme, toggle } = useTheme();
-  const [profile, setProfile] = useState<ProfileData>({ display_name: null, bio: null, has_avatar: false });
+  const [profile, setProfile] = useState<ProfileData>({
+    display_name: null,
+    bio: null,
+    has_avatar: false,
+    avatar_drive_file_id: null,
+    avatar_account_index: null,
+  });
   const [avatarKey, setAvatarKey] = useState(0);
   const [avatarLoaded, setAvatarLoaded] = useState(false);
+  const [avatarUrl, setAvatarUrl] = useState<string | null>(null);
   const [showModal, setShowModal] = useState(false);
   const [editName, setEditName] = useState("");
   const [editBio, setEditBio] = useState("");
@@ -29,7 +42,13 @@ export default function Navbar({ onMenuOpen }: { onMenuOpen?: () => void }) {
       const res = await authenticatedFetch("/api/profile", token);
       if (res.ok) {
         const d = await res.json();
-        setProfile({ display_name: d.display_name, bio: d.bio, has_avatar: d.has_avatar });
+        setProfile({
+          display_name: d.display_name,
+          bio: d.bio,
+          has_avatar: d.has_avatar,
+          avatar_drive_file_id: d.avatar_drive_file_id,
+          avatar_account_index: d.avatar_account_index,
+        });
       }
     } catch (err) {
       console.error("[Navbar] Fetch profile error:", err);
@@ -58,7 +77,11 @@ export default function Navbar({ onMenuOpen }: { onMenuOpen?: () => void }) {
         method: "PUT",
         body: JSON.stringify({ display_name: editName, bio: editBio }),
       });
-      setProfile({ display_name: editName || null, bio: editBio || null, has_avatar: profile.has_avatar });
+      setProfile((prev) => ({
+        ...prev,
+        display_name: editName || null,
+        bio: editBio || null,
+      }));
       setShowModal(false);
     } catch (err) {
        console.error("[Navbar] Save profile error:", err);
@@ -77,14 +100,49 @@ export default function Navbar({ onMenuOpen }: { onMenuOpen?: () => void }) {
       await authenticatedFetch("/api/profile/avatar", token, { method: "POST", body: form });
       setAvatarKey((k) => k + 1);
       setAvatarLoaded(false);
-      setProfile((prev) => ({ ...prev, has_avatar: true }));
+      await refreshProfile();
     } catch (err) {
       console.error("[Navbar] Avatar upload error:", err);
     }
     e.target.value = "";
   }
 
-  const avatarUrl = profile.has_avatar ? `/api/profile/avatar?t=${avatarKey}` : user?.imageUrl;
+  useEffect(() => {
+    let active = true;
+    let blobUrl = "";
+
+    async function loadAvatar() {
+      if (!profile.has_avatar || !profile.avatar_drive_file_id || profile.avatar_account_index == null) {
+        setAvatarUrl(null);
+        return;
+      }
+
+      try {
+        const token = await getToken();
+        blobUrl = await fetchMediaBlobUrl(`/api/profile/avatar?t=${avatarKey}`, token, {
+          accountIndex: profile.avatar_account_index,
+          driveFileId: profile.avatar_drive_file_id,
+        });
+        if (active) setAvatarUrl(blobUrl);
+      } catch {
+        if (active) setAvatarUrl(`/api/profile/avatar?t=${avatarKey}`);
+      }
+    }
+
+    loadAvatar();
+    return () => {
+      active = false;
+      if (blobUrl) URL.revokeObjectURL(blobUrl);
+    };
+  }, [
+    avatarKey,
+    getToken,
+    profile.avatar_account_index,
+    profile.avatar_drive_file_id,
+    profile.has_avatar,
+  ]);
+
+  const resolvedAvatarUrl = avatarUrl || (!profile.has_avatar ? user?.imageUrl : null);
   const displayName = profile.display_name || user?.fullName || user?.firstName || "Profile";
 
   return (
@@ -129,10 +187,10 @@ export default function Navbar({ onMenuOpen }: { onMenuOpen?: () => void }) {
               <svg className="h-4 w-4 text-sd-text3" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={1.5}>
                 <path strokeLinecap="round" strokeLinejoin="round" d="M15.75 6a3.75 3.75 0 1 1-7.5 0 3.75 3.75 0 0 1 7.5 0ZM4.501 20.118a7.5 7.5 0 0 1 14.998 0A17.933 17.933 0 0 1 12 21.75c-2.676 0-5.216-.584-7.499-1.632Z" />
               </svg>
-              {avatarUrl && (
+              {resolvedAvatarUrl && (
                 <img
                   key={avatarKey}
-                  src={avatarUrl}
+                  src={resolvedAvatarUrl}
                   alt=""
                   className={`absolute inset-0 h-full w-full object-cover ${avatarLoaded ? "" : "hidden"}`}
                   onLoad={() => setAvatarLoaded(true)}
@@ -182,10 +240,10 @@ export default function Navbar({ onMenuOpen }: { onMenuOpen?: () => void }) {
                   <svg className="h-8 w-8 text-sd-text3" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={1.5}>
                     <path strokeLinecap="round" strokeLinejoin="round" d="M15.75 6a3.75 3.75 0 1 1-7.5 0 3.75 3.75 0 0 1 7.5 0ZM4.501 20.118a7.5 7.5 0 0 1 14.998 0A17.933 17.933 0 0 1 12 21.75c-2.676 0-5.216-.584-7.499-1.632Z" />
                   </svg>
-                  {avatarUrl && (
+                  {resolvedAvatarUrl && (
                     <img
                       key={avatarKey}
-                      src={avatarUrl}
+                      src={resolvedAvatarUrl}
                       alt=""
                       className={`absolute inset-0 h-full w-full object-cover ${avatarLoaded ? "" : "hidden"}`}
                       onLoad={() => setAvatarLoaded(true)}
