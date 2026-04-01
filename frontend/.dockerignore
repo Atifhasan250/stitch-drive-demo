@@ -1,0 +1,13 @@
+# Dependencies (reinstalled inside the image)
+node_modules/
+
+# Build output (produced during docker build)
+.next/
+out/
+dist/
+.turbo/
+*.tsbuildinfo
+
+# OS
+.DS_Store
+Thumbs.db

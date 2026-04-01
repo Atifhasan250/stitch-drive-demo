@@ -1,0 +1,51 @@
+version: "3.9"
+
+services:
+  mongo:
+    image: mongo:7
+    restart: unless-stopped
+    volumes:
+      - stitchdrive_mongo:/data/db
+    networks:
+      - stitchdrive
+
+  backend:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    restart: unless-stopped
+    env_file:
+      - .env
+    environment:
+      MONGO_URI: mongodb://mongo:27017/stitchdrive
+      FRONTEND_URL: ${FRONTEND_URL:-http://localhost:3000}
+      BACKEND_URL: ${BACKEND_URL:-http://localhost:8000}
+      CONFIG_DIR: /config
+    volumes:
+      - ./config:/config:ro
+    ports:
+      - "8000:8000"
+    depends_on:
+      - mongo
+    networks:
+      - stitchdrive
+
+  frontend:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile
+    restart: unless-stopped
+    environment:
+      NEXT_PUBLIC_API_URL: ${BACKEND_URL:-http://localhost:8000}
+    ports:
+      - "3000:3000"
+    depends_on:
+      - backend
+    networks:
+      - stitchdrive
+
+volumes:
+  stitchdrive_mongo:
+
+networks:
+  stitchdrive:

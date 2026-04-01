@@ -1,0 +1,63 @@
+services:
+  # ── MongoDB Service ──────────────────────────────────────────────────────────
+  # Provides local, persistent storage without needing an external Atlas cluster.
+  mongodb:
+    image: mongo:latest
+    container_name: stitchdrive-db
+    ports:
+      - "27017:27017" # Host:Container
+    volumes:
+      - stitchdrive_mongo_data:/data/db
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "mongosh", "--eval", "db.adminCommand('ping')"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # ── Backend Service ──────────────────────────────────────────────────────────
+  backend:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    container_name: stitchdrive-backend
+    ports:
+      - "8000:8000"
+    depends_on:
+      mongodb:
+        condition: service_healthy
+    environment:
+      - MONGO_URI=mongodb://mongodb:27017/stitchdrive
+      - PORT=8000
+      - NODE_ENV=production
+      - FRONTEND_URL=${FRONTEND_URL:-http://localhost:3000}
+      - BACKEND_URL=${BACKEND_URL:-http://localhost:8000}
+      - CLERK_PUBLISHABLE_KEY=${CLERK_PUBLISHABLE_KEY}
+      - CLERK_SECRET_KEY=${CLERK_SECRET_KEY}
+    restart: unless-stopped
+
+  # ── Frontend Service ─────────────────────────────────────────────────────────
+  frontend:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile
+      args:
+        # Baked in at build time for Clerk and API redirection
+        NEXT_PUBLIC_CLERK_PUBLISHABLE_KEY: ${NEXT_PUBLIC_CLERK_PUBLISHABLE_KEY}
+        CLERK_SECRET_KEY: ${CLERK_SECRET_KEY}
+        NEXT_PUBLIC_API_URL: http://backend:8000 # Internal context
+    container_name: stitchdrive-frontend
+    ports:
+      - "3000:3000"
+    environment:
+      # Also available at runtime
+      - NEXT_PUBLIC_CLERK_PUBLISHABLE_KEY=${NEXT_PUBLIC_CLERK_PUBLISHABLE_KEY}
+      - CLERK_SECRET_KEY=${CLERK_SECRET_KEY}
+      - NEXT_PUBLIC_API_URL=http://backend:8000 
+    depends_on:
+      - backend
+    restart: unless-stopped
+
+volumes:
+  # Persists the database even if containers are deleted
+  stitchdrive_mongo_data:
