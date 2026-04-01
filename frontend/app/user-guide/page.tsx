@@ -102,7 +102,7 @@ export default function UserGuidePage() {
                   Go to the Google Cloud Console
                 </p>
                 <p className="text-sm text-sd-text2 pl-6">
-                  Visit <a href="https://console.cloud.google.com" target="_blank" className="text-sd-accent font-bold hover:underline">console.cloud.google.com</a> and create a new project called "My Drive Pool".
+                  Visit <a href="https://console.cloud.google.com" target="_blank" rel="noopener noreferrer" className="text-sd-accent font-bold hover:underline">console.cloud.google.com</a> and create a new project called "My Drive Pool".
                 </p>
               </div>
 

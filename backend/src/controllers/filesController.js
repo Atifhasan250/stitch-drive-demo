@@ -32,6 +32,9 @@ const SAFE_THUMBNAIL_HOSTS = [
   "drive.google.com",
   "docs.google.com",
 ];
+const DRIVE_ID_REGEX = /^[a-zA-Z0-9_-]{10,200}$/;
+const FOLDER_MIME_TYPE = "application/vnd.google-apps.folder";
+const MAX_INLINE_VIEW_SIZE = 100 * 1024 * 1024;
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
@@ -74,28 +77,162 @@ function isValidFileName(name) {
   return true;
 }
 
+function isValidDriveId(id) {
+  return typeof id === "string" && DRIVE_ID_REGEX.test(id);
+}
+
+function requireDriveId(id, fieldName = "driveFileId", options = {}) {
+  if (options.allowRoot && id === "root") {
+    return id;
+  }
+
+  if (!isValidDriveId(id)) {
+    const err = new Error(`Invalid ${fieldName}`);
+    err.statusCode = 400;
+    throw err;
+  }
+
+  return id;
+}
+
+function buildTypeQuery(type) {
+  switch (type) {
+    case "folder":
+      return { mimeType: FOLDER_MIME_TYPE };
+    case "image":
+      return { mimeType: /^image\// };
+    case "video":
+      return { mimeType: /^video\// };
+    case "audio":
+      return { mimeType: /^audio\// };
+    case "pdf":
+      return { mimeType: /pdf/i };
+    case "doc":
+      return {
+        $or: [
+          { mimeType: /document/i },
+          { mimeType: /^text\// },
+        ],
+      };
+    case "sheet":
+      return { mimeType: /(spreadsheet|sheet)/i };
+    case "archive":
+      return { mimeType: /(zip|compressed|archive)/i };
+    default:
+      return null;
+  }
+}
+
+function buildSort(sortBy) {
+  switch (sortBy) {
+    case "name-asc":
+      return { fileName: 1, _id: 1 };
+    case "name-desc":
+      return { fileName: -1, _id: -1 };
+    case "size-asc":
+      return { size: 1, _id: 1 };
+    case "size-desc":
+      return { size: -1, _id: -1 };
+    case "date-asc":
+      return { createdAt: 1, _id: 1 };
+    default:
+      return { createdAt: -1, _id: -1 };
+  }
+}
+
+async function sendThumbnailResponse(urlString, res) {
+  const response = await fetchWithTimeout(urlString, {}, 5000);
+  if (!response.ok) {
+    const err = new Error("Failed to fetch thumbnail from Google");
+    err.httpStatus = response.status;
+    throw err;
+  }
+
+  const contentType = response.headers.get("content-type") || "image/jpeg";
+  res.setHeader("Content-Type", contentType);
+  res.setHeader("Cache-Control", "public, max-age=604800, stale-while-revalidate=86400");
+
+  const buffer = await response.arrayBuffer();
+  return res.send(Buffer.from(buffer));
+}
+
 // ── POST /api/files/sync ──────────────────────────────────────────────────────
 export async function syncFiles(req, res) {
   const ownerId = req.ownerId;
-  syncFilesFromDrives(ownerId, req.clientCredentials).catch((err) =>
-    console.error(`[Sync] Background sync error for ${ownerId}:`, err.message)
-  );
-  return res.json({ ok: true });
+  try {
+    await syncFilesFromDrives(ownerId, req.clientCredentials);
+    return res.json({ ok: true });
+  } catch (err) {
+    console.error(`[Sync] Error for ${ownerId}:`, err.message);
+    return res.status(500).json({ detail: "Synchronization failed" });
+  }
 }
 
 // ── GET /api/files ────────────────────────────────────────────────────────────
 export async function listFiles(req, res) {
   const ownerId = req.ownerId;
   const page = Math.max(1, parseInt(req.query.page, 10) || 1);
-  const limit = Math.min(Math.max(1, parseInt(req.query.limit, 10) || 1000), 1000);
+  const limit = Math.min(Math.max(1, parseInt(req.query.limit, 10) || 1000), 5000);
   const skip = (page - 1) * limit;
+  const requestedParent = typeof req.query.parent === "string" ? req.query.parent : null;
+  const foldersOnly = req.query.foldersOnly === "true";
+  const search = typeof req.query.search === "string" ? req.query.search.trim() : "";
+  const type = typeof req.query.type === "string" ? req.query.type : "all";
+  const sortBy = typeof req.query.sort === "string" ? req.query.sort : "date-desc";
+  const requestedAccountIndex =
+    typeof req.query.accountIndex === "string" && req.query.accountIndex !== "all"
+      ? parseInt(req.query.accountIndex, 10)
+      : null;
   const connected = await DriveAccount.find({ ownerId, isConnected: true }).select("accountIndex").lean();
   const connectedIndices = connected.map((a) => a.accountIndex);
+  const scopedIndices =
+    requestedAccountIndex != null && connectedIndices.includes(requestedAccountIndex)
+      ? [requestedAccountIndex]
+      : connectedIndices;
 
-  const query = { ownerId, accountIndex: { $in: connectedIndices } };
+  const query = { ownerId, accountIndex: { $in: scopedIndices } };
+  const andConditions = [];
+
+  if (foldersOnly) {
+    query.mimeType = FOLDER_MIME_TYPE;
+  }
+
+  const typeQuery = buildTypeQuery(type);
+  if (typeQuery) {
+    andConditions.push(typeQuery);
+  }
+
+  if (search) {
+    query.fileName = { $regex: search.replace(/[.*+?^${}()|[\]\\]/g, "\\$&"), $options: "i" };
+  }
+
+  if (requestedParent === "root") {
+    const folderDocs = await File.find({
+      ownerId,
+      accountIndex: { $in: scopedIndices },
+      mimeType: FOLDER_MIME_TYPE,
+    })
+      .select("driveFileId -_id")
+      .lean();
+    const folderIds = folderDocs.map((doc) => doc.driveFileId);
+    andConditions.push({
+      $or: [
+        { parentDriveFileId: null },
+        { parentDriveFileId: { $nin: folderIds } },
+      ],
+    });
+  } else if (requestedParent) {
+    requireDriveId(requestedParent, "parent");
+    query.parentDriveFileId = requestedParent;
+  }
+
+  if (andConditions.length > 0) {
+    query.$and = andConditions;
+  }
+
   const [files, total] = await Promise.all([
     File.find(query)
-      .sort({ createdAt: -1 })
+      .sort(buildSort(sortBy))
       .skip(skip)
       .limit(limit)
       .lean(),
@@ -113,6 +250,14 @@ export async function initiateUpload(req, res) {
   const ownerId = req.ownerId;
   const { fileName, mimeType, parentFolderId } = req.body;
   let { accountIndex } = req.body;
+
+  if (parentFolderId) {
+    try {
+      requireDriveId(parentFolderId, "parentFolderId");
+    } catch (err) {
+      return res.status(err.statusCode || 400).json({ detail: err.message });
+    }
+  }
 
   if (accountIndex === undefined || accountIndex === null) {
     accountIndex = await pickBestAccount(ownerId, req.clientCredentials);
@@ -164,6 +309,11 @@ export async function initiateUpload(req, res) {
 export async function finalizeUpload(req, res) {
   const ownerId = req.ownerId;
   const { driveFileId, accountIndex } = req.body;
+  try {
+    requireDriveId(driveFileId, "driveFileId");
+  } catch (err) {
+    return res.status(err.statusCode || 400).json({ detail: err.message });
+  }
   const account = await DriveAccount.findOne({ ownerId, accountIndex });
   if (!account) return res.status(404).json({ detail: "Account not found" });
 
@@ -206,6 +356,34 @@ export async function finalizeUpload(req, res) {
 }
 
 // ── GET /api/files/:fileId/thumbnail ─────────────────────────────────────────
+export async function abortUpload(req, res) {
+  const ownerId = req.ownerId;
+  const { driveFileId, accountIndex } = req.body;
+
+  if (!driveFileId || accountIndex === undefined) {
+    return res.status(400).json({ detail: "driveFileId and accountIndex are required" });
+  }
+
+  try {
+    requireDriveId(driveFileId, "driveFileId");
+  } catch (err) {
+    return res.status(err.statusCode || 400).json({ detail: err.message });
+  }
+
+  const account = await DriveAccount.findOne({ ownerId, accountIndex });
+  if (!account || !account.isConnected) {
+    return res.status(404).json({ detail: "Account not found" });
+  }
+
+  try {
+    await deleteDriveFile(account, driveFileId, req.clientCredentials);
+    return res.status(204).send();
+  } catch (err) {
+    console.error("[Upload] Abort error:", err.message);
+    return res.status(500).json({ detail: "Failed to abort upload" });
+  }
+}
+
 export async function getThumbnail(req, res) {
   const ownerId = req.ownerId;
   if (!isValidObjectId(req.params.fileId)) {
@@ -223,18 +401,39 @@ export async function getThumbnail(req, res) {
   }
 
   try {
-    const response = await fetchWithTimeout(file.thumbnailLink, {}, 5000);
-    if (!response.ok) throw new Error("Failed to fetch thumbnail from Google");
-
-    const contentType = response.headers.get("content-type") || "image/jpeg";
-    res.setHeader("Content-Type", contentType);
-    // Aggressive caching: Thumbnails rarely change. 7 days to save on free tier CPU/Bandwidth.
-    res.setHeader("Cache-Control", "public, max-age=604800, stale-while-revalidate=86400"); 
-
-    const buffer = await response.arrayBuffer();
-    return res.send(Buffer.from(buffer));
+    return await sendThumbnailResponse(file.thumbnailLink, res);
   } catch (err) {
-    console.error(`[Thumbnail] Error for file ${file.driveFileId}:`, err.message);
+    const status = err.httpStatus;
+    if (status !== 401 && status !== 403) {
+      console.error(`[Thumbnail] Error for file ${file.driveFileId}:`, err.message);
+      return res.status(502).json({ detail: "Error fetching thumbnail proxy" });
+    }
+  }
+
+  const account = await DriveAccount.findOne({ ownerId, accountIndex: file.accountIndex });
+  if (!account || !account.isConnected) {
+    return res.status(503).json({ detail: "Account not connected" });
+  }
+
+  try {
+    const drive = buildService(account, req.clientCredentials);
+    const meta = await drive.files.get({
+      fileId: file.driveFileId,
+      fields: "thumbnailLink",
+    });
+    const freshUrl = meta.data.thumbnailLink;
+    if (!freshUrl || !isSafeThumbnailUrl(freshUrl)) {
+      return res.status(404).json({ detail: "Thumbnail not available" });
+    }
+
+    if (freshUrl !== file.thumbnailLink) {
+      file.thumbnailLink = freshUrl;
+      await file.save();
+    }
+
+    return await sendThumbnailResponse(freshUrl, res);
+  } catch (err) {
+    console.error(`[Thumbnail] Refresh error for file ${file.driveFileId}:`, err.message);
     return res.status(502).json({ detail: "Error fetching thumbnail proxy" });
   }
 }
@@ -280,6 +479,12 @@ export async function getView(req, res) {
   }
   const file = await File.findOne({ _id: req.params.fileId, ownerId });
   if (!file) return res.status(404).json({ detail: "File not found" });
+
+  if ((file.size || 0) > MAX_INLINE_VIEW_SIZE) {
+    return res.status(413).json({
+      detail: "This file is too large to preview through the server. Open it in Google Drive instead.",
+    });
+  }
 
   const account = await DriveAccount.findOne({ ownerId, accountIndex: file.accountIndex });
   if (!account || !account.isConnected) {
@@ -343,6 +548,11 @@ export async function moveFileRoute(req, res) {
   const { new_parent_drive_file_id } = req.body;
   if (!new_parent_drive_file_id) {
     return res.status(400).json({ detail: "new_parent_drive_file_id is required" });
+  }
+  try {
+    requireDriveId(new_parent_drive_file_id, "new_parent_drive_file_id", { allowRoot: true });
+  } catch (err) {
+    return res.status(err.statusCode || 400).json({ detail: err.message });
   }
 
   const file = await File.findOne({ _id: req.params.fileId, ownerId });
@@ -453,6 +663,11 @@ export async function downloadSharedFile(req, res) {
   const accountIndex = parseInt(req.params.accountIndex, 10);
   if (isNaN(accountIndex)) return res.status(400).json({ detail: "Invalid account index" });
   const { driveFileId } = req.params;
+  try {
+    requireDriveId(driveFileId, "driveFileId");
+  } catch (err) {
+    return res.status(err.statusCode || 400).json({ detail: err.message });
+  }
 
   const account = await DriveAccount.findOne({ ownerId, accountIndex });
   if (!account || !account.isConnected) {
@@ -484,6 +699,11 @@ export async function listSharedChildren(req, res) {
   const accountIndex = parseInt(req.params.accountIndex, 10);
   if (isNaN(accountIndex)) return res.status(400).json({ detail: "Invalid account index" });
   const { folderId } = req.params;
+  try {
+    requireDriveId(folderId, "folderId");
+  } catch (err) {
+    return res.status(err.statusCode || 400).json({ detail: err.message });
+  }
 
   const account = await DriveAccount.findOne({ ownerId, accountIndex });
   if (!account || !account.isConnected) {
@@ -514,6 +734,11 @@ export async function deleteSharedFile(req, res) {
   const accountIndex = parseInt(req.params.accountIndex, 10);
   if (isNaN(accountIndex)) return res.status(400).json({ detail: "Invalid account index" });
   const { driveFileId } = req.params;
+  try {
+    requireDriveId(driveFileId, "driveFileId");
+  } catch (err) {
+    return res.status(err.statusCode || 400).json({ detail: err.message });
+  }
 
   const account = await DriveAccount.findOne({ ownerId, accountIndex });
   if (!account || !account.isConnected) {
@@ -582,6 +807,11 @@ export async function restoreTrashFile(req, res) {
   const accountIndex = parseInt(req.params.accountIndex, 10);
   if (isNaN(accountIndex)) return res.status(400).json({ detail: "Invalid account index" });
   const { driveFileId } = req.params;
+  try {
+    requireDriveId(driveFileId, "driveFileId");
+  } catch (err) {
+    return res.status(err.statusCode || 400).json({ detail: err.message });
+  }
 
   const account = await DriveAccount.findOne({ ownerId, accountIndex });
   if (!account || !account.isConnected) {
@@ -602,6 +832,11 @@ export async function deleteTrashFile(req, res) {
   const accountIndex = parseInt(req.params.accountIndex, 10);
   if (isNaN(accountIndex)) return res.status(400).json({ detail: "Invalid account index" });
   const { driveFileId } = req.params;
+  try {
+    requireDriveId(driveFileId, "driveFileId");
+  } catch (err) {
+    return res.status(err.statusCode || 400).json({ detail: err.message });
+  }
 
   const account = await DriveAccount.findOne({ ownerId, accountIndex });
   if (!account || !account.isConnected) {

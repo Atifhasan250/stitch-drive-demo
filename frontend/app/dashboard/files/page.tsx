@@ -18,19 +18,35 @@ type SortKey = "date-desc" | "date-asc" | "name-asc" | "name-desc" | "size-desc"
 type BreadcrumbEntry = { id: string | null; name: string };
 
 export default function FilesPage() {
-  const { files, refreshFiles } = useFiles();
+  const [breadcrumb, setBreadcrumb] = useState<BreadcrumbEntry[]>([{ id: null, name: "All Files" }]);
+  const currentFolder = breadcrumb[breadcrumb.length - 1];
+  const currentFolderId = currentFolder.id;
+  const currentFolderName = currentFolder.name;
+  const [page, setPage] = useState(1);
+  const [search, setSearch] = useState("");
+  const [filterAccount, setFilterAccount] = useState<number | "all">("all");
+  const [filterType, setFilterType] = useState<TypeFilter>("all");
+  const [sortBy, setSortBy] = useState<SortKey>("date-desc");
+  const { files, total, hasMore, refreshFiles } = useFiles({
+    parent: currentFolderId,
+    page,
+    limit: 100,
+    search,
+    accountIndex: filterAccount,
+    type: filterType,
+    sort: sortBy,
+  });
+  const { files: folderFiles, refreshFiles: refreshFolders } = useFiles({
+    foldersOnly: true,
+    limit: 5000,
+  });
   const { accounts, refreshStorage } = useStorage();
   const { syncAll, isSyncing, syncError } = useSync();
   const { upload, addCompleteListener, setCurrentFolder, toast, updateToast, confirm } = useUpload();
   const { getToken } = useAuth();
   const [view, setView] = useState<"list" | "grid">("grid");
-  const [breadcrumb, setBreadcrumb] = useState<BreadcrumbEntry[]>([{ id: null, name: "All Files" }]);
   const scrollStack = useRef<number[]>([]);
   const fileInputRef = useRef<HTMLInputElement>(null);
-  const [search, setSearch] = useState("");
-  const [filterAccount, setFilterAccount] = useState<number | "all">("all");
-  const [filterType, setFilterType] = useState<TypeFilter>("all");
-  const [sortBy, setSortBy] = useState<SortKey>("date-desc");
   const [draggedFile, setDraggedFile] = useState<FileItem | null>(null);
   const [shareModal, setShareModal] = useState<{ file: FileItem; link: string | null; loading: boolean; revoking: boolean } | null>(null);
   const [previewFile, setPreviewFile] = useState<FileItem | null>(null);
@@ -92,14 +108,11 @@ export default function FilesPage() {
     const unsub = addCompleteListener(() => {
       markStatsDirty();
       refreshFiles();
+      refreshFolders();
       refreshStorage();
     });
     return unsub;
-  }, [addCompleteListener, refreshFiles, refreshStorage]);
-
-  const currentFolder = breadcrumb[breadcrumb.length - 1];
-  const currentFolderId = currentFolder.id;
-  const currentFolderName = currentFolder.name;
+  }, [addCompleteListener, refreshFiles, refreshFolders, refreshStorage]);
 
   useEffect(() => {
     setCurrentFolder(currentFolderId, currentFolderId ? currentFolderName : null);
@@ -111,75 +124,25 @@ export default function FilesPage() {
     return () => window.removeEventListener("dragend", onDragEnd);
   }, []);
 
+  useEffect(() => {
+    setPage(1);
+  }, [currentFolderId, search, filterAccount, filterType, sortBy]);
+
   const panelFolders = useMemo(() => {
     if (!draggedFile) return [];
-    return files.filter(
+    return folderFiles.filter(
       (f) => f.account_index === draggedFile.account_index &&
-             f.mime_type === "application/vnd.google-apps.folder" &&
              f.id !== draggedFile.id
     );
-  }, [draggedFile, files]);
+  }, [draggedFile, folderFiles]);
 
-  const folderIds = useMemo(() => {
-    const ids = new Set<string>();
-    for (const f of files) {
-      if (f.mime_type === "application/vnd.google-apps.folder") ids.add(f.drive_file_id);
-    }
-    return ids;
-  }, [files]);
-
-  const visibleFiles = useMemo(() => {
-    if (currentFolder.id === null) {
-      return files.filter((f) => !f.parent_drive_file_id || !folderIds.has(f.parent_drive_file_id));
-    }
-    return files.filter((f) => f.parent_drive_file_id === currentFolder.id);
-  }, [files, currentFolder, folderIds]);
-
-  const filteredFiles = useMemo(() => {
-    let result = visibleFiles;
-
-    if (search) {
-      const q = search.toLowerCase();
-      result = result.filter((f) => f.file_name.toLowerCase().includes(q));
-    }
-
-    if (filterAccount !== "all") {
-      result = result.filter((f) => f.account_index === filterAccount);
-    }
-
-    if (filterType !== "all") {
-      result = result.filter((f) => {
-        const m = f.mime_type ?? "";
-        switch (filterType) {
-          case "folder": return m === "application/vnd.google-apps.folder";
-          case "image": return m.startsWith("image/");
-          case "video": return m.startsWith("video/");
-          case "audio": return m.startsWith("audio/");
-          case "pdf": return m.includes("pdf");
-          case "sheet": return m.includes("spreadsheet") || m.includes("sheet");
-          case "archive": return m.includes("zip") || m.includes("compressed") || m.includes("archive");
-          case "doc": return m.includes("document") || m.startsWith("text/");
-          default: return true;
-        }
-      });
-    }
-
-    return [...result].sort((a, b) => {
-      switch (sortBy) {
-        case "name-asc": return a.file_name.localeCompare(b.file_name);
-        case "name-desc": return b.file_name.localeCompare(a.file_name);
-        case "size-asc": return a.size - b.size;
-        case "size-desc": return b.size - a.size;
-        case "date-asc": return new Date(a.created_at).getTime() - new Date(b.created_at).getTime();
-        default: return new Date(b.created_at).getTime() - new Date(a.created_at).getTime();
-      }
-    });
-  }, [visibleFiles, search, filterAccount, filterType, sortBy]);
+  const filteredFiles = files;
 
   function openFolder(file: FileItem) {
     const scroller = document.getElementById("sd-scroll");
     scrollStack.current = [...scrollStack.current, scroller?.scrollTop ?? 0];
     setBreadcrumb((prev) => [...prev, { id: file.drive_file_id, name: file.file_name }]);
+    setPage(1);
     setTimeout(() => { document.getElementById("sd-scroll")?.scrollTo({ top: 0 }); }, 0);
   }
 
@@ -187,6 +150,7 @@ export default function FilesPage() {
     const savedScroll = scrollStack.current[index] ?? 0;
     scrollStack.current = scrollStack.current.slice(0, index);
     setBreadcrumb((prev) => prev.slice(0, index + 1));
+    setPage(1);
     setTimeout(() => {
       const scroller = document.getElementById("sd-scroll");
       if (scroller) scroller.scrollTop = savedScroll;
@@ -204,6 +168,7 @@ export default function FilesPage() {
       });
       if (!res.ok) throw new Error();
       refreshFiles();
+      refreshFolders();
       updateToast(tid, "success", "Renamed");
     } catch (err: any) {
       updateToast(tid, "error", err.message || "Rename failed");
@@ -220,6 +185,7 @@ export default function FilesPage() {
       if (!res.ok) throw new Error(String(res.status));
       markStatsDirty();
       await refreshFiles();
+      refreshFolders();
       refreshStorage();
       updateToast(tid, "success", "Deleted");
     } catch (err: any) {
@@ -244,6 +210,7 @@ export default function FilesPage() {
           return;
         }
         await refreshFiles();
+        refreshFolders();
         updateToast(tid, "success", successMsg);
       } catch (err: any) {
         updateToast(tid, "error", err.message || "Move failed");
@@ -298,10 +265,11 @@ export default function FilesPage() {
   async function handleSync() {
     await syncAll();
     refreshFiles();
+    refreshFolders();
   }
 
   function handleFileInputChange(e: React.ChangeEvent<HTMLInputElement>) {
-    Array.from(e.target.files ?? []).forEach((f) => upload(f, currentFolder.id));
+    Array.from(e.target.files ?? []).forEach((f) => upload(f, currentFolderId));
     e.target.value = "";
   }
 
@@ -474,9 +442,7 @@ export default function FilesPage() {
               <div>
                 <h1 className="font-display text-3xl font-bold text-sd-text">Files</h1>
                 <p className="mt-1 text-sm font-medium text-sd-text3">
-                  {filteredFiles.length !== visibleFiles.length
-                    ? `Showing ${filteredFiles.length} of ${visibleFiles.length} items`
-                    : `${visibleFiles.length} ${visibleFiles.length === 1 ? "item" : "items"}`}
+                  {`${total} ${total === 1 ? "item" : "items"}`}
                 </p>
               </div>
             </div>
@@ -646,74 +612,112 @@ export default function FilesPage() {
           )}
         </div>
       ) : view === "grid" ? (
-        <div className="grid grid-cols-2 gap-4 sm:grid-cols-3 md:grid-cols-4 lg:grid-cols-5 xl:grid-cols-6 animate-fade-in">
-          {filteredFiles.map((file) => (
-            <GridCard
-              key={file.id}
-              file={file}
-              onOpen={openFolder}
-              onRename={handleRename}
-              onDelete={handleDelete}
-              onMove={handleMove}
-              onUploadInto={upload}
-              inFolder={currentFolder.id !== null}
-              onMoveToRoot={() => handleMove(file.id, "root")}
-              onDragStartFile={handleDragStartFile}
-              onShare={handleShare}
-              onPreview={setPreviewFile}
-              onMoveToAccount={setMoveToAccountFile}
-              selectionMode={selectionMode}
-              selected={selectedItems.has(file.id)}
-              onSelectMode={() => {
-                 setSelectionMode(true);
-                 setSelectedItems(new Set([file.id]));
-              }}
-              onToggleSelect={() => handleToggleSelect(file.id)}
-            />
-          ))}
-        </div>
-      ) : (
-        <div className="overflow-hidden stat-card rounded-2xl border border-sd-border shadow-sm animate-fade-in">
-          <div className="overflow-x-auto">
-            <table className="w-full text-left">
-              <thead>
-                <tr className="border-b border-sd-border bg-sd-bg/50">
-                  <th className="px-5 py-3.5 text-xs font-bold uppercase tracking-widest text-sd-text3">Name</th>
-                  <th className="hidden px-5 py-3.5 text-xs font-bold uppercase tracking-widest text-sd-text3 sm:table-cell">Size</th>
-                  <th className="hidden px-5 py-3.5 text-xs font-bold uppercase tracking-widest text-sd-text3 md:table-cell">Account</th>
-                  <th className="hidden px-5 py-3.5 text-xs font-bold uppercase tracking-widest text-sd-text3 md:table-cell">Modified</th>
-                  <th className="px-5 py-3.5 text-right text-xs font-bold uppercase tracking-widest text-sd-text3">Actions</th>
-                </tr>
-              </thead>
-              <tbody>
-                {filteredFiles.map((file) => (
-                  <ListRow
-                    key={file.id}
-                    file={file}
-                    onOpen={openFolder}
-                    onRename={handleRename}
-                    onDelete={handleDelete}
-                    onMove={handleMove}
-                    onUploadInto={upload}
-                    inFolder={currentFolder.id !== null}
-                    onMoveToRoot={() => handleMove(file.id, "root")}
-                    onDragStartFile={handleDragStartFile}
-                    onShare={handleShare}
-                    onPreview={setPreviewFile}
-                    onMoveToAccount={setMoveToAccountFile}
-                    selectionMode={selectionMode}
-                    selected={selectedItems.has(file.id)}
-                    onSelectMode={() => {
-                       setSelectionMode(true);
-                       setSelectedItems(new Set([file.id]));
-                    }}
-                    onToggleSelect={() => handleToggleSelect(file.id)}
-                  />
-                ))}
-              </tbody>
-            </table>
+        <>
+          <div className="grid grid-cols-2 gap-4 sm:grid-cols-3 md:grid-cols-4 lg:grid-cols-5 xl:grid-cols-6 animate-fade-in">
+            {filteredFiles.map((file) => (
+              <GridCard
+                key={file.id}
+                file={file}
+                onOpen={openFolder}
+                onRename={handleRename}
+                onDelete={handleDelete}
+                onMove={handleMove}
+                onUploadInto={upload}
+                inFolder={currentFolder.id !== null}
+                onMoveToRoot={() => handleMove(file.id, "root")}
+                onDragStartFile={handleDragStartFile}
+                onShare={handleShare}
+                onPreview={setPreviewFile}
+                onMoveToAccount={setMoveToAccountFile}
+                selectionMode={selectionMode}
+                selected={selectedItems.has(file.id)}
+                onSelectMode={() => {
+                   setSelectionMode(true);
+                   setSelectedItems(new Set([file.id]));
+                }}
+                onToggleSelect={() => handleToggleSelect(file.id)}
+              />
+            ))}
           </div>
-        </div>
+          <div className="mt-6 flex items-center justify-between gap-3 rounded-2xl border border-sd-border bg-sd-s1 px-4 py-3 text-sm text-sd-text2 shadow-sm">
+            <button
+              onClick={() => setPage((prev) => Math.max(1, prev - 1))}
+              disabled={page === 1}
+              className="rounded-xl border border-sd-border bg-sd-bg px-4 py-2 font-semibold transition hover:bg-sd-hover disabled:opacity-50"
+            >
+              Previous
+            </button>
+            <span>Page {page}</span>
+            <button
+              onClick={() => setPage((prev) => prev + 1)}
+              disabled={!hasMore}
+              className="rounded-xl border border-sd-border bg-sd-bg px-4 py-2 font-semibold transition hover:bg-sd-hover disabled:opacity-50"
+            >
+              Next
+            </button>
+          </div>
+        </>
+      ) : (
+        <>
+          <div className="overflow-hidden stat-card rounded-2xl border border-sd-border shadow-sm animate-fade-in">
+            <div className="overflow-x-auto">
+              <table className="w-full text-left">
+                <thead>
+                  <tr className="border-b border-sd-border bg-sd-bg/50">
+                    <th className="px-5 py-3.5 text-xs font-bold uppercase tracking-widest text-sd-text3">Name</th>
+                    <th className="hidden px-5 py-3.5 text-xs font-bold uppercase tracking-widest text-sd-text3 sm:table-cell">Size</th>
+                    <th className="hidden px-5 py-3.5 text-xs font-bold uppercase tracking-widest text-sd-text3 md:table-cell">Account</th>
+                    <th className="hidden px-5 py-3.5 text-xs font-bold uppercase tracking-widest text-sd-text3 md:table-cell">Modified</th>
+                    <th className="px-5 py-3.5 text-right text-xs font-bold uppercase tracking-widest text-sd-text3">Actions</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {filteredFiles.map((file) => (
+                    <ListRow
+                      key={file.id}
+                      file={file}
+                      onOpen={openFolder}
+                      onRename={handleRename}
+                      onDelete={handleDelete}
+                      onMove={handleMove}
+                      onUploadInto={upload}
+                      inFolder={currentFolder.id !== null}
+                      onMoveToRoot={() => handleMove(file.id, "root")}
+                      onDragStartFile={handleDragStartFile}
+                      onShare={handleShare}
+                      onPreview={setPreviewFile}
+                      onMoveToAccount={setMoveToAccountFile}
+                      selectionMode={selectionMode}
+                      selected={selectedItems.has(file.id)}
+                      onSelectMode={() => {
+                         setSelectionMode(true);
+                         setSelectedItems(new Set([file.id]));
+                      }}
+                      onToggleSelect={() => handleToggleSelect(file.id)}
+                    />
+                  ))}
+                </tbody>
+              </table>
+            </div>
+          </div>
+          <div className="mt-6 flex items-center justify-between gap-3 rounded-2xl border border-sd-border bg-sd-s1 px-4 py-3 text-sm text-sd-text2 shadow-sm">
+            <button
+              onClick={() => setPage((prev) => Math.max(1, prev - 1))}
+              disabled={page === 1}
+              className="rounded-xl border border-sd-border bg-sd-bg px-4 py-2 font-semibold transition hover:bg-sd-hover disabled:opacity-50"
+            >
+              Previous
+            </button>
+            <span>Page {page}</span>
+            <button
+              onClick={() => setPage((prev) => prev + 1)}
+              disabled={!hasMore}
+              className="rounded-xl border border-sd-border bg-sd-bg px-4 py-2 font-semibold transition hover:bg-sd-hover disabled:opacity-50"
+            >
+              Next
+            </button>
+          </div>
+        </>
       )}
     </div>
     </>

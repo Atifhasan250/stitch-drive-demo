@@ -136,7 +136,7 @@ export default function DocsPage() {
                 <div className="space-y-2">
                   <a href="#faq" className="block text-sm text-sd-text3 hover:text-sd-accent transition">FAQ</a>
                   <a href="#troubleshooting" className="block text-sm text-sd-text3 hover:text-sd-accent transition">Common Issues</a>
-                  <a href="https://github.com/Atifhasan250/stitch-drive" target="_blank" className="block text-sm text-sd-text3 hover:text-sd-accent transition">GitHub Repo</a>
+                  <a href="https://github.com/Atifhasan250/stitch-drive" target="_blank" rel="noopener noreferrer" className="block text-sm text-sd-text3 hover:text-sd-accent transition">GitHub Repo</a>
                 </div>
               </div>
             </div>

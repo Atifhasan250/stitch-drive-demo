@@ -14,6 +14,7 @@ import {
   getThumbnail,
   initiateUpload,
   finalizeUpload,
+  abortUpload,
   downloadSharedFile,
   listSharedChildren,
   deleteSharedFile,
@@ -49,6 +50,7 @@ router.delete("/trash/:accountIndex/:driveFileId", deleteTrashFile);
 router.get("/", listFiles);
 router.post("/upload/initiate", uploadLimiter, initiateUpload);
 router.post("/upload/finalize", uploadLimiter, finalizeUpload);
+router.post("/upload/abort", uploadLimiter, abortUpload);
 router.get("/:fileId/download", downloadLimiter, getDownload);
 router.post("/:fileId/download", downloadLimiter, getDownload);
 router.get("/:fileId/view", downloadLimiter, getView);

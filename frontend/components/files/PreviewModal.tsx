@@ -7,6 +7,7 @@ export function PreviewModal({ file, onClose }: { file: FileItem; onClose: () =>
   const { getToken } = useAuth();
   const [authenticatedUrl, setAuthenticatedUrl] = useState<string | null>(null);
   const [loading, setLoading] = useState(true);
+  const [previewError, setPreviewError] = useState<string | null>(null);
   
   const mime = file.mime_type ?? "";
   const isGoogleWorkspace = mime.startsWith("application/vnd.google-apps.") && mime !== "application/vnd.google-apps.folder";
@@ -28,11 +29,15 @@ export function PreviewModal({ file, onClose }: { file: FileItem; onClose: () =>
         });
         if (active) {
           setAuthenticatedUrl(blobUrl);
+          setPreviewError(null);
           setLoading(false);
         }
-      } catch (err) {
+      } catch (err: any) {
         console.error("[Preview] Error loading media:", err);
-        if (active) setLoading(false);
+        if (active) {
+          setPreviewError(err.message || "Preview unavailable");
+          setLoading(false);
+        }
       }
     }
 
@@ -98,9 +103,17 @@ export function PreviewModal({ file, onClose }: { file: FileItem; onClose: () =>
 
     if (!authenticatedUrl) {
        return (
-         <div className="flex flex-col items-center justify-center gap-4 py-24 text-center text-rose-400">
-           <p className="font-semibold">Authentication required to view this file.</p>
-           <button onClick={onClose} className="text-sm underline">Close</button>
+         <div className="flex flex-col items-center justify-center gap-4 py-24 text-center">
+           <p className="font-semibold text-rose-400">{previewError || "Preview unavailable for this file."}</p>
+           <a
+             href={`https://drive.google.com/file/d/${file.drive_file_id}/view`}
+             target="_blank"
+             rel="noopener noreferrer"
+             className="btn-primary flex items-center gap-2 rounded-xl px-6 py-3 text-sm font-semibold transition mt-2"
+           >
+             Open in Google Drive
+           </a>
+           <button onClick={onClose} className="text-sm text-sd-text3 underline">Close</button>
          </div>
        );
     }

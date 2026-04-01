@@ -8,6 +8,8 @@ import { BoundedTTLCache } from "../utils/BoundedTTLCache.js";
 
 const SCOPES = ["https://www.googleapis.com/auth/drive"];
 const PROFILE_FOLDER_NAME = "_StitchDrive_";
+const ACCOUNT_SYNC_CONCURRENCY = 2;
+const _ownerSyncs = new Map();
 
 export function loadClientConfig(credentials = null) {
   if (!credentials) {
@@ -598,64 +600,22 @@ function parseDriveTime(s) {
   return new Date(s);
 }
 
-export async function syncFilesFromDrives(ownerId, credentials = null) {
-  const accounts = await DriveAccount.find({ ownerId, isConnected: true }).lean();
-  await Promise.allSettled(accounts.map(async (account) => {
-    try {
-      const driveFiles = await listAllFiles(account, credentials);
-      const driveIds = new Set(driveFiles.map((f) => f.id));
-
-      await File.deleteMany({
-        ownerId: account.ownerId,
-        accountIndex: account.accountIndex,
-        driveFileId: { $nin: Array.from(driveIds) },
-      });
-
-      if (driveFiles.length > 0) {
-        const ops = driveFiles.map((df) => ({
-          updateOne: {
-            filter: { driveFileId: df.id, accountIndex: account.accountIndex },
-            update: {
-              $set: {
-                fileName: df.name || "",
-                size: parseInt(df.size || "0", 10),
-                mimeType: df.mimeType || null,
-                thumbnailLink: df.thumbnailLink || null,
-                parentDriveFileId: df.parents?.[0] || null,
-              },
-              $setOnInsert: {
-                driveFileId: df.id,
-                accountIndex: account.accountIndex,
-                ownerId: account.ownerId,
-                createdAt: parseDriveTime(df.createdTime),
-              },
-            },
-            upsert: true,
-          },
-        }));
-        await File.bulkWrite(ops, { ordered: false });
-      }
-
-      invalidateQuotaCache(account.ownerId, account.accountIndex);
-    } catch (err) {
-      console.error(`[Sync] Error syncing account ${account.accountIndex}:`, err.message);
-    }
-  }));
-}
-export async function cleanupDeletedFiles(ownerId, accountIndex, currentDriveIds) {
-  await File.deleteMany({
-    ownerId,
-    accountIndex,
-    driveFileId: { $nin: currentDriveIds },
-  });
+function isOwnedDriveFile(file) {
+  return Array.isArray(file?.owners) && file.owners.some((owner) => owner?.me);
 }
 
-export async function reconcileAccountFiles(ownerId, accountIndex, driveFiles) {
+async function getStartPageToken(account, credentials = null) {
+  const drive = buildService(account, credentials);
+  const result = await retryOnRateLimit(() => drive.changes.getStartPageToken());
+  return result.data.startPageToken || null;
+}
+
+async function upsertAccountFiles(ownerId, accountIndex, driveFiles) {
   if (!driveFiles || driveFiles.length === 0) return;
 
   const ops = driveFiles.map((df) => ({
     updateOne: {
-      filter: { driveFileId: df.id, accountIndex: accountIndex },
+      filter: { ownerId, driveFileId: df.id, accountIndex },
       update: {
         $set: {
           fileName: df.name || "",
@@ -666,8 +626,8 @@ export async function reconcileAccountFiles(ownerId, accountIndex, driveFiles) {
         },
         $setOnInsert: {
           driveFileId: df.id,
-          accountIndex: accountIndex,
-          ownerId: ownerId,
+          accountIndex,
+          ownerId,
           createdAt: parseDriveTime(df.createdTime),
         },
       },
@@ -676,4 +636,132 @@ export async function reconcileAccountFiles(ownerId, accountIndex, driveFiles) {
   }));
 
   await File.bulkWrite(ops, { ordered: false });
+}
+
+async function fullSyncAccount(account, credentials = null) {
+  const driveFiles = await listAllFiles(account, credentials);
+  const driveIds = new Set(driveFiles.map((f) => f.id));
+
+  await File.deleteMany({
+    ownerId: account.ownerId,
+    accountIndex: account.accountIndex,
+    driveFileId: { $nin: Array.from(driveIds) },
+  });
+
+  await upsertAccountFiles(account.ownerId, account.accountIndex, driveFiles);
+
+  account.changesPageToken = await getStartPageToken(account, credentials);
+  await account.save();
+}
+
+async function incrementalSyncAccount(account, credentials = null) {
+  const drive = buildService(account, credentials);
+  const changedFiles = [];
+  const deletedIds = new Set();
+  let pageToken = account.changesPageToken;
+  let nextStartPageToken = null;
+
+  do {
+    const result = await retryOnRateLimit(() =>
+      drive.changes.list({
+        pageToken,
+        pageSize: 1000,
+        fields: "nextPageToken,newStartPageToken,changes(fileId,removed,file(id,name,size,mimeType,thumbnailLink,createdTime,parents,trashed,owners(me)))",
+      })
+    );
+
+    for (const change of result.data.changes || []) {
+      const driveFileId = change.fileId;
+      if (!driveFileId) continue;
+
+      if (change.removed || change.file?.trashed || !change.file || !isOwnedDriveFile(change.file)) {
+        deletedIds.add(driveFileId);
+        continue;
+      }
+
+      changedFiles.push(change.file);
+    }
+
+    pageToken = result.data.nextPageToken || null;
+    nextStartPageToken = result.data.newStartPageToken || nextStartPageToken;
+  } while (pageToken);
+
+  if (deletedIds.size > 0) {
+    await File.deleteMany({
+      ownerId: account.ownerId,
+      accountIndex: account.accountIndex,
+      driveFileId: { $in: Array.from(deletedIds) },
+    });
+  }
+
+  await upsertAccountFiles(account.ownerId, account.accountIndex, changedFiles);
+
+  if (nextStartPageToken) {
+    account.changesPageToken = nextStartPageToken;
+    await account.save();
+  }
+}
+
+async function runWithConcurrency(items, concurrency, worker) {
+  const queue = [...items];
+  const runners = Array.from({ length: Math.min(concurrency, queue.length) }, async () => {
+    while (queue.length > 0) {
+      const item = queue.shift();
+      if (item) {
+        await worker(item);
+      }
+    }
+  });
+  await Promise.allSettled(runners);
+}
+
+export async function syncFilesFromDrives(ownerId, credentials = null) {
+  const inFlight = _ownerSyncs.get(ownerId);
+  if (inFlight) return inFlight;
+
+  const syncPromise = (async () => {
+    const accounts = await DriveAccount.find({ ownerId, isConnected: true });
+    await runWithConcurrency(accounts, ACCOUNT_SYNC_CONCURRENCY, async (account) => {
+      try {
+        if (!account.changesPageToken) {
+          await fullSyncAccount(account, credentials);
+        } else {
+          try {
+            await incrementalSyncAccount(account, credentials);
+          } catch (err) {
+            const status = err?.code || err?.status || err?.response?.status;
+            if (status === 410) {
+              account.changesPageToken = null;
+              await account.save();
+              await fullSyncAccount(account, credentials);
+            } else {
+              throw err;
+            }
+          }
+        }
+
+        invalidateQuotaCache(account.ownerId, account.accountIndex);
+      } catch (err) {
+        console.error(`[Sync] Error syncing account ${account.accountIndex}:`, err.message);
+      }
+    });
+  })();
+
+  _ownerSyncs.set(ownerId, syncPromise);
+  try {
+    await syncPromise;
+  } finally {
+    _ownerSyncs.delete(ownerId);
+  }
+}
+export async function cleanupDeletedFiles(ownerId, accountIndex, currentDriveIds) {
+  await File.deleteMany({
+    ownerId,
+    accountIndex,
+    driveFileId: { $nin: currentDriveIds },
+  });
+}
+
+export async function reconcileAccountFiles(ownerId, accountIndex, driveFiles) {
+  await upsertAccountFiles(ownerId, accountIndex, driveFiles);
 }

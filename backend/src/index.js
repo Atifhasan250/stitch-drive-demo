@@ -26,7 +26,26 @@ const PORT = process.env.PORT || 8000;
 const IS_PROD = process.env.NODE_ENV === "production";
 
 // ── Security headers ──────────────────────────────────────────────────────────
-app.use(helmet());
+app.use(
+  helmet({
+    contentSecurityPolicy: {
+      directives: {
+        defaultSrc: ["'none'"],
+        baseUri: ["'self'"],
+        formAction: ["'self'"],
+        frameAncestors: ["'none'"],
+        objectSrc: ["'none'"],
+        scriptSrc: ["'none'"],
+        styleSrc: ["'self'", "'unsafe-inline'"],
+        imgSrc: ["'self'", "data:", "https:"],
+        fontSrc: ["'self'", "data:", "https:"],
+        connectSrc: ["'self'", "https://www.googleapis.com", "https://api.clerk.com", "https://*.clerk.accounts.dev"],
+        mediaSrc: ["'self'", "blob:", "https:"],
+      },
+    },
+    crossOriginResourcePolicy: false,
+  })
+);
 
 // ── Request logger ────────────────────────────────────────────────────────────
 app.use(morgan(IS_PROD ? "combined" : "dev"));

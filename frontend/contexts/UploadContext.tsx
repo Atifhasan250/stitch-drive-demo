@@ -7,6 +7,7 @@ import { authenticatedFetch } from "@/lib/api";
 type Snack = { id: number; name: string; progress: number; status: "uploading" | "done" | "error" };
 type Toast = { id: number; message: string; type: "loading" | "success" | "error" };
 type ConfirmState = { message: string; description?: string; confirmLabel: string; danger: boolean; onConfirm: () => void };
+const MAX_BROWSER_MOVE_SIZE = 500 * 1024 * 1024;
 
 interface UploadCtx {
   upload: (file: File | Blob, parentFolderDriveId?: string | null, targetAccountIndex?: number | null) => void;
@@ -186,22 +187,17 @@ export function UploadProvider({ children }: { children: React.ReactNode }) {
     try {
       const token = await getToken();
 
-      // Step 1: Get Source Token
-      setSnacks((s) => s.map((sn) => (sn.id === id ? { ...sn, name: `[1/3] Downloading: ${fileName}` } : sn)));
-      const tokenRes = await authenticatedFetch(`/api/accounts/${file.account_index}/token`, token);
-      if (!tokenRes.ok) throw new Error("Source auth failed");
-      const { accessToken } = await tokenRes.json();
+      if (typeof file.size === "number" && file.size > MAX_BROWSER_MOVE_SIZE) {
+        throw new Error("File too large for browser-side transfer (max 500MB).");
+      }
 
-      // Step 2: Download directly from Google to Browser
-      const downloadRes = await fetch(`https://www.googleapis.com/drive/v3/files/${file.drive_file_id}?alt=media`, {
-        headers: { Authorization: `Bearer ${accessToken}` }
-      });
-      if (!downloadRes.ok) throw new Error("Download from Google failed");
-      
-      // Track download progress if possible? Fetch doesn't support easily but for simplicity we assume it's fast-ish
+      // Step 1: Download from the backend proxy so Google tokens never reach the browser.
+      setSnacks((s) => s.map((sn) => (sn.id === id ? { ...sn, name: `[1/3] Downloading: ${fileName}` } : sn)));
+      const downloadRes = await authenticatedFetch(`/api/files/${file.id}/download`, token, { method: "POST" });
+      if (!downloadRes.ok) throw new Error("Source download failed");
       const blob = await downloadRes.blob();
 
-      // Step 3: Initiate resumable upload to target account
+      // Step 2: Initiate resumable upload to target account
       setSnacks((s) => s.map((sn) => (sn.id === id ? { ...sn, progress: 30, name: `[2/3] Uploading: ${fileName}` } : sn)));
       const mimeType = file.mime_type || "application/octet-stream";
       
@@ -268,16 +264,12 @@ export function UploadProvider({ children }: { children: React.ReactNode }) {
         }
       } else if (targetDriveFileId) {
         try {
-          const rollbackTokenRes = await authenticatedFetch(`/api/accounts/${targetAccountIndex}/token`, await getToken());
-          if (rollbackTokenRes.ok) {
-            const { accessToken } = await rollbackTokenRes.json();
-            await fetch(`https://www.googleapis.com/drive/v3/files/${targetDriveFileId}`, {
-              method: "DELETE",
-              headers: { Authorization: `Bearer ${accessToken}` },
-            });
-          }
+          await authenticatedFetch("/api/files/upload/abort", await getToken(), {
+            method: "POST",
+            body: JSON.stringify({ driveFileId: targetDriveFileId, accountIndex: targetAccountIndex }),
+          });
         } catch (rollbackErr) {
-          console.error("[Move] Direct rollback failed:", rollbackErr);
+          console.error("[Move] Rollback abort failed:", rollbackErr);
         }
       }
 

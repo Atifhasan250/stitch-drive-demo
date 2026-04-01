@@ -7,7 +7,6 @@ import {
   getAllQuotas,
   invalidateOAuth2Cache,
   invalidateQuotaCache,
-  getOAuth2Client,
   getOAuthFlow,
   getAuthUrl,
   syncFilesFromDrives,
@@ -134,30 +133,6 @@ export async function disconnectAccount(req, res) {
 }
 
 // ── GET /api/accounts/:accountIndex/token ────────────────────────────────────
-export async function getAccessToken(req, res) {
-  const accountIndex = parseInt(req.params.accountIndex, 10);
-  const ownerId = req.ownerId;
-  
-  if (isNaN(accountIndex)) {
-    return res.status(400).json({ detail: "Invalid account index" });
-  }
-
-  const account = await DriveAccount.findOne({ ownerId, accountIndex });
-  if (!account || !account.isConnected) {
-    return res.status(404).json({ detail: "Account not found or not connected" });
-  }
-
-  try {
-    const oauth2Client = getOAuth2Client(account, req.clientCredentials);
-    const { token } = await oauth2Client.getAccessToken();
-    return res.json({ accessToken: token });
-  } catch (err) {
-    console.error("[Account] Error getting token:", err.message);
-    const status = err.message.includes("credentials") ? 401 : 500;
-    return res.status(status).json({ detail: err.message });
-  }
-}
-
 // ── GET /api/accounts/oauth/new ───────────────────────────────────────────────
 export async function getNewOAuthUrl(req, res) {
   const ownerId = req.ownerId;
@@ -290,9 +265,8 @@ export async function oauthCallback(req, res) {
   } catch (err) {
     console.error("[OAuth] Callback Processing Error:", {
       message: err.message,
-      stack: err.stack,
       code: err.code,
-      response: err.response?.data
+      httpStatus: err.response?.status
     });
     return res.redirect(`${config.FRONTEND_URL}/dashboard/settings?error=oauth_processing_failed`);
   }

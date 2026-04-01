@@ -1,1537 +1,1042 @@
-# STITCHDRIVE CODEBASE — SECURITY AUDIT & REFACTOR INSTRUCTIONS
-# Generated: 2026-04-01
-# Purpose: Fix all identified bugs, security issues, and performance problems
-# Instructions: Read EVERY file referenced before making ANY change.Do not hallucinate file paths or function signatures. Verify each file exists and read its current content before editing.
+# StitchDrive — Full Security & Code Quality Audit
+**Prepared by:** Senior Software & Security Engineer Review  
+**Codebase:** StitchDrive (Next.js 15 Frontend + Express.js Backend + MongoDB)  
+**Date:** April 2026
 
-================================================================================
-PRE-FLIGHT CHECKLIST FOR AI AGENT
-================================================================================
+---
 
-Before starting ANY fix:
-1. Read the entire file you are about to modify
-2. Understand all imports and dependencies
-3. Do not rename existing variables unless instructed
-4. Do not change unrelated code in the same file
-5. After each fix, verify the change compiles/parses correctly
-6. Work through fixes in ORDER — some fixes depend on earlier ones
+## Table of Contents
 
-================================================================================
-FIX #1 — CRITICAL SECURITY: Google credentials must NOT be stored in localStorage
-================================================================================
+1. [🔴 Critical Security Issues](#-critical-security-issues)
+2. [🟠 High Severity Bugs & Issues](#-high-severity-bugs--issues)
+3. [🟡 Medium Severity Issues](#-medium-severity-issues)
+4. [🔵 Low Severity / Code Quality Issues](#-low-severity--code-quality-issues)
+5. [🟢 Performance Improvements](#-performance-improvements)
+6. [🏗️ Architecture & Design Improvements](#-architecture--design-improvements)
+7. [✅ Quick Win Checklist](#-quick-win-checklist)
 
-PROBLEM:
-- File: frontend/components/CredentialsUpload.tsx
-- File: frontend/lib/api.ts
-- File: frontend/contexts/UploadContext.tsx
-- File: frontend/hooks/useSync.ts
-- Currently: localStorage.setItem("credentials", credString) stores the full
-  Google OAuth client_secret in the browser. Any XSS attack can steal it.
-  The credentials are also injected into every API request body and header.
+---
 
-SOLUTION OVERVIEW:
-- User uploads credentials.json once via the UI
-- Frontend sends it to a new backend endpoint POST /api/credentials/store
-- Backend encrypts it using the existing encryptToken() function and stores
-  it in a new MongoDB collection tied to the user's Clerk ownerId
-- Frontend never stores the raw credentials again
-- All backend services that need credentials fetch them from DB directly
-- Frontend only needs to tell the backend "use my stored credentials"
-- A new boolean flag in the frontend state tracks whether credentials are uploaded
+## 🔴 Critical Security Issues
 
-STEP 1 — Create new MongoDB model: backend/src/models/UserCredentials.js
-Create this file with the following content:
-```javascript
-import mongoose from "mongoose";
+---
 
-const userCredentialsSchema = new mongoose.Schema(
-  {
-    ownerId: { type: String, required: true, unique: true, index: true },
-    encryptedCredentials: { type: String, required: true },
-    clientId: { type: String, required: true },
-    uploadedAt: { type: Date, default: () => new Date() },
-  },
-  { collection: "user_credentials", timestamps: false }
-);
+### CRIT-01 — Google Access Tokens Exposed to Browser (MAJOR)
 
-const UserCredentials = mongoose.model("UserCredentials", userCredentialsSchema);
-export default UserCredentials;
-```
+**File:** `frontend/lib/api.ts`, `frontend/hooks/useSync.ts`
 
-STEP 2 — Create new controller: backend/src/controllers/credentialsController.js
-Create this file with the following content:
-```javascript
-import UserCredentials from "../models/UserCredentials.js";
-import { encryptToken, decryptToken } from "../services/authService.js";
+**Problem:**  
+The app fetches raw Google OAuth access tokens from the backend (`/api/accounts/:accountIndex/token`) and then uses them **directly in the browser** to call Google's APIs. This exposes live OAuth tokens in browser memory, XHR/Fetch logs, DevTools, and any browser extension that can intercept network traffic.
 
-// POST /api/credentials/store
-export async function storeCredentials(req, res) {
-  const ownerId = req.ownerId;
-  const { credentials } = req.body;
-
-  if (!credentials || typeof credentials !== "object") {
-    return res.status(400).json({ detail: "credentials object is required" });
-  }
-
-  const config = credentials.web || credentials.installed || credentials;
-  if (!config.client_id || !config.client_secret) {
-    return res.status(400).json({ detail: "Missing client_id or client_secret in credentials" });
-  }
-
-  const encrypted = encryptToken(JSON.stringify(credentials));
-
-  await UserCredentials.findOneAndUpdate(
-    { ownerId },
-    {
-      encryptedCredentials: encrypted,
-      clientId: config.client_id,
-      uploadedAt: new Date(),
-    },
-    { upsert: true, new: true }
-  );
-
-  return res.json({ ok: true, clientId: config.client_id });
-}
-
-// GET /api/credentials/status
-export async function getCredentialsStatus(req, res) {
-  const ownerId = req.ownerId;
-  const record = await UserCredentials.findOne({ ownerId }).lean();
-  return res.json({
-    hasCredentials: !!record,
-    clientId: record?.clientId || null,
-    uploadedAt: record?.uploadedAt || null,
-  });
-}
-
-// DELETE /api/credentials
-export async function deleteCredentials(req, res) {
-  const ownerId = req.ownerId;
-  await UserCredentials.deleteOne({ ownerId });
-  return res.json({ ok: true });
-}
-
-// Internal helper used by other backend services
-export async function getDecryptedCredentials(ownerId) {
-  const record = await UserCredentials.findOne({ ownerId }).lean();
-  if (!record) return null;
-  try {
-    return JSON.parse(decryptToken(record.encryptedCredentials));
-  } catch {
-    return null;
-  }
-}
-```
-
-STEP 3 — Create new route: backend/src/routes/credentials.js
-Create this file with the following content:
-```javascript
-import { Router } from "express";
-import { requireAuth } from "../middlewares/auth.js";
-import {
-  storeCredentials,
-  getCredentialsStatus,
-  deleteCredentials,
-} from "../controllers/credentialsController.js";
-
-const router = Router();
-
-router.post("/store", requireAuth, storeCredentials);
-router.get("/status", requireAuth, getCredentialsStatus);
-router.delete("/", requireAuth, deleteCredentials);
-
-export default router;
-```
-
-STEP 4 — Register new route in: backend/src/index.js
-Find the routes section (the block that has app.use("/api/accounts"...)) and add:
-```javascript
-import credentialsRoutes from "./routes/credentials.js";
-// Add this line alongside the other app.use() route registrations:
-app.use("/api/credentials", credentialsRoutes);
-```
-
-STEP 5 — Update backend/src/middlewares/auth.js
-Replace the entire file content with the following. This version loads credentials
-from DB instead of from the request header when header is absent:
-```javascript
-import { getAuth } from "@clerk/express";
-import { getDecryptedCredentials } from "../controllers/credentialsController.js";
-
-export async function requireAuth(req, res, next) {
-  const clerkAuth = getAuth(req);
-  if (!clerkAuth?.userId) {
-    return res.status(401).json({ detail: "Not authenticated via Clerk" });
-  }
-
-  req.user = { sub: clerkAuth.userId };
-  req.ownerId = clerkAuth.userId;
-
-  // Allow explicit override from header (used for OAuth flow initiation only)
-  const headerCreds = req.headers["x-credentials"];
-  if (headerCreds) {
-    try {
-      req.clientCredentials = typeof headerCreds === "string"
-        ? JSON.parse(headerCreds)
-        : headerCreds;
-    } catch {
-      console.warn("[Auth] Failed to parse X-Credentials header, will load from DB");
-    }
-  }
-
-  // If no header creds, load from DB (the new default behavior)
-  if (!req.clientCredentials) {
-    try {
-      req.clientCredentials = await getDecryptedCredentials(clerkAuth.userId);
-    } catch (err) {
-      console.error("[Auth] Failed to load credentials from DB:", err.message);
-    }
-  }
-
-  return next();
-}
-```
-
-STEP 6 — Update frontend/components/CredentialsUpload.tsx
-Replace the entire file content with the following:
 ```typescript
-"use client";
+// frontend/lib/api.ts — token used directly in browser
+const tokenRes = await authenticatedFetch(`/api/accounts/${accountIndex}/token`, token);
+const { accessToken } = await tokenRes.json();
+const driveRes = await fetch(`https://www.googleapis.com/drive/v3/files/${driveFileId}?alt=media`, {
+  headers: { Authorization: `Bearer ${accessToken}` }
+});
+```
 
-import { useState, useEffect, useRef } from "react";
-import { useAuth } from "@clerk/nextjs";
+**Risk:** Any XSS attack, malicious browser extension, or compromised CDN could steal these tokens. An attacker with a Google access token can access the victim's entire Google Drive.
 
-type CredentialStatus = "none" | "valid" | "invalid" | "checking";
+**Fix:**  
+All Google API calls that require authenticated access should be **proxied through your backend**, not made directly from the browser. The backend already supports `/api/files/:fileId/download` for downloads. Remove the `getAccessToken` endpoint entirely or restrict it to server-to-server use only.
 
-export function CredentialsUpload() {
-  const { getToken } = useAuth();
-  const [status, setStatus] = useState<CredentialStatus>("none");
-  const [isHovered, setIsHovered] = useState(false);
-  const fileInputRef = useRef<HTMLInputElement>(null);
+```javascript
+// REMOVE this endpoint from production or gate it to server-only contexts
+router.get("/:accountIndex/token", getAccessToken); // <- REMOVE
+```
 
-  useEffect(() => {
-    checkStatus();
-  }, []);
+For the sync hook (`useSync.ts`), move the entire Drive listing logic to the backend.
 
-  const checkStatus = async () => {
-    setStatus("checking");
-    try {
-      const token = await getToken();
-      const res = await fetch("/api/credentials/status", {
-        headers: { Authorization: `Bearer ${token}` },
-      });
-      if (res.ok) {
-        const data = await res.json();
-        setStatus(data.hasCredentials ? "valid" : "none");
-      } else {
-        setStatus("none");
-      }
-    } catch {
-      setStatus("none");
-    }
-  };
+---
 
-  const handleFileChange = async (e: React.ChangeEvent<HTMLInputElement>) => {
-    const file = e.target.files?.[0];
-    if (!file) return;
+### CRIT-02 — Encryption Silently Downgrades to AES-128 Instead of AES-256
 
-    const reader = new FileReader();
-    reader.onload = async (event) => {
-      const content = event.target?.result as string;
-      try {
-        const json = JSON.parse(content);
-        const config = json.web || json.installed || json;
-        if (!config.client_id || !config.client_secret) {
-          throw new Error("Missing client_id or client_secret");
-        }
+**File:** `backend/src/services/authService.js`
 
-        const token = await getToken();
-        const res = await fetch("/api/credentials/store", {
-          method: "POST",
-          headers: {
-            Authorization: `Bearer ${token}`,
-            "Content-Type": "application/json",
-          },
-          body: JSON.stringify({ credentials: json }),
-        });
+**Problem:**  
+The `_fernetKeys` function reads a base64-encoded 32-byte key but only uses the last 16 bytes for encryption (AES-128-CBC). This is weaker than industry-standard AES-256. The code also uses CBC mode, which is vulnerable to padding oracle attacks if error messages are not carefully controlled.
 
-        if (res.ok) {
-          setStatus("valid");
-        } else {
-          setStatus("invalid");
-        }
-      } catch {
-        setStatus("invalid");
-      }
-    };
-    reader.readAsText(file);
-    e.target.value = "";
-  };
+```javascript
+// authService.js
+const cipher = crypto.createCipheriv("aes-128-cbc", encryptionKey, iv); // Only 128-bit!
+```
 
-  return (
-    <div className="flex items-center gap-3">
-      <input
-        type="file"
-        ref={fileInputRef}
-        onChange={handleFileChange}
-        className="hidden"
-        accept=".json"
-      />
-      <button
-        onClick={() => fileInputRef.current?.click()}
-        onMouseEnter={() => setIsHovered(true)}
-        onMouseLeave={() => setIsHovered(false)}
-        className={`relative flex items-center gap-2 rounded-xl border px-4 py-2 text-sm font-medium transition-all duration-300 shadow-sm
-          ${status === "valid"
-            ? "border-emerald-500/30 bg-emerald-500/5 text-emerald-400 hover:bg-emerald-500/10"
-            : status === "invalid"
-            ? "border-rose-500/30 bg-rose-500/5 text-rose-400 hover:bg-rose-500/10"
-            : "border-sd-border bg-sd-s1 text-sd-text2 hover:border-sd-accent/40 hover:text-sd-text"
-          }`}
-      >
-        <svg className="h-4 w-4" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
-          <path strokeLinecap="round" strokeLinejoin="round" d="M3 16.5v2.25A2.25 2.25 0 0 0 5.25 21h13.5A2.25 2.25 0 0 0 21 18.75V16.5m-13.5-9L12 3m0 0 4.5 4.5M12 3v13.5" />
-        </svg>
-        <span>{status === "valid" ? "Credentials Linked" : "Upload Credentials"}</span>
-        <div className="ml-1 flex h-5 w-5 items-center justify-center">
-          {status === "checking" ? (
-            <svg className="h-4 w-4 animate-spin text-sd-accent" fill="none" viewBox="0 0 24 24">
-              <circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4" />
-              <path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4z" />
-            </svg>
-          ) : status === "valid" ? (
-            <div className="flex h-5 w-5 items-center justify-center rounded-full bg-emerald-500 text-white">
-              <svg className="h-3.5 w-3.5" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={3}>
-                <path strokeLinecap="round" strokeLinejoin="round" d="m4.5 12.75 6 6 9-13.5" />
-              </svg>
-            </div>
-          ) : status === "invalid" ? (
-            <div className="flex h-5 w-5 items-center justify-center rounded-full bg-rose-500 text-white">
-              <svg className="h-3.5 w-3.5" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={3}>
-                <path strokeLinecap="round" strokeLinejoin="round" d="M6 18 18 6M6 6l12 12" />
-              </svg>
-            </div>
-          ) : null}
-        </div>
-        {isHovered && status === "invalid" && (
-          <div className="absolute top-full right-0 mt-2 w-64 rounded-xl border border-rose-500/20 bg-sd-s2 p-3 text-xs text-rose-400 shadow-xl z-50">
-            <p className="font-semibold mb-1">Invalid Credentials</p>
-            <p className="text-sd-text3 leading-relaxed">The JSON file is malformed or missing required fields.</p>
-          </div>
-        )}
-      </button>
-    </div>
-  );
+**Fix:**  
+Switch to AES-256-GCM (authenticated encryption that prevents padding oracle attacks):
+
+```javascript
+export function encryptToken(plaintext) {
+  const key = Buffer.from(config.ENCRYPTION_KEY, "base64"); // 32 bytes
+  const iv = crypto.randomBytes(12); // 96-bit IV for GCM
+  const cipher = crypto.createCipheriv("aes-256-gcm", key, iv);
+  const ciphertext = Buffer.concat([cipher.update(plaintext, "utf8"), cipher.final()]);
+  const tag = cipher.getAuthTag(); // Authentication tag prevents tampering
+  return Buffer.concat([iv, tag, ciphertext]).toString("base64url");
 }
 ```
 
-STEP 7 — Update frontend/lib/api.ts
-Replace the entire file with the following. Credentials are NO LONGER read from
-localStorage. The backend now handles them internally:
-```typescript
-const API_BASE = "";
+---
 
-/**
- * Performs an authenticated fetch to the backend using only the Clerk JWT.
- * Google credentials are now stored server-side and loaded automatically.
- */
-export async function authenticatedFetch(
-  url: string,
-  token: string | null,
-  options: RequestInit = {}
-): Promise<Response> {
-  const headers = new Headers(options.headers || {});
-  if (token) headers.set("Authorization", `Bearer ${token}`);
+### CRIT-03 — OAuth Callback Does Not Verify Session Ownership
 
-  // Always set Content-Type for JSON bodies
-  const method = (options.method || "GET").toUpperCase();
-  if (options.body && typeof options.body === "string" && !headers.has("Content-Type")) {
-    headers.set("Content-Type", "application/json");
-  }
+**File:** `backend/src/controllers/accountsController.js`
 
+**Problem:**  
+The OAuth callback route has no `requireAuth` middleware:
+
+```javascript
+router.get("/oauth/callback", loginLimiter, oauthCallback); // No requireAuth!
+```
+
+The signed state parameter does embed `ownerId`, but this `ownerId` is self-reported from when the flow was initiated. A CSRF or session fixation attack could potentially complete an OAuth flow for a different user's account slot if the state HMAC is somehow reused or forged.
+
+**Fix:**  
+While the HMAC-signed state is good protection, also set a short-lived `httpOnly` cookie at the start of the OAuth flow containing the `ownerId`, and verify it matches the state's `ownerId` in the callback. This creates a second layer of CSRF protection.
+
+---
+
+### CRIT-04 — Google `client_secret` Sent in Every HTTP Request Header
+
+**File:** `backend/src/middlewares/auth.js`
+
+**Problem:**  
+The auth middleware reads full Google OAuth credentials from an `X-Credentials` HTTP header:
+
+```javascript
+const headerCreds = req.headers["x-credentials"];
+if (headerCreds) {
+  req.clientCredentials = JSON.parse(headerCreds);
+}
+```
+
+This means the `client_secret` is being sent in **every HTTP request header** from the frontend. HTTP headers appear in browser DevTools for any user who opens them, server access logs, proxy/CDN logs, and any network monitoring tool on the same network.
+
+**Risk:** The `client_secret` is the key to impersonating your entire Google Cloud app and generating OAuth tokens for anyone.
+
+**Fix:**  
+Remove the `X-Credentials` header mechanism entirely. The backend already stores credentials server-side via `/api/credentials/store`. Always load credentials from the database (which is the fallback and works fine).
+
+```javascript
+// REMOVE this entire block from auth.js:
+const headerCreds = req.headers["x-credentials"];
+if (headerCreds) {
   try {
-    return await fetch(url, {
-      ...options,
-      method,
-      headers,
-      credentials: "include",
-    });
-  } catch (err: any) {
-    console.error(`[API] Fetch Error (${url}):`, err.message);
+    req.clientCredentials = typeof headerCreds === "string"
+      ? JSON.parse(headerCreds)
+      : headerCreds;
+  } catch { ... }
+}
+```
+
+---
+
+### CRIT-05 — Insufficient Drive File ID Validation (Injection Risk)
+
+**File:** `backend/src/services/driveService.js`
+
+**Problem:**  
+The `sanitizeId` function is only used in one place and only removes single quotes:
+
+```javascript
+function sanitizeId(id) {
+  return id?.replace(/'/g, ""); // Incomplete!
+}
+// Only used in listSharedFolderChildren — other functions pass IDs directly
+```
+
+Drive file IDs are used directly in Google Drive API query strings (`q` parameters) in multiple functions without validation. While Google's API client library provides some protection, user-supplied IDs should always be validated.
+
+**Fix:**  
+Add a strict allowlist validator and apply it everywhere:
+
+```javascript
+function validateDriveId(id, fieldName = "driveFileId") {
+  if (!id || typeof id !== "string" || !/^[a-zA-Z0-9_\-]{10,200}$/.test(id)) {
+    const err = new Error(`Invalid ${fieldName}`);
+    err.statusCode = 400;
     throw err;
   }
+  return id;
 }
+// Apply at the top of every controller function that receives a driveFileId
+```
 
-/**
- * Downloads a file directly from Google Drive using a server-issued access token.
- * Falls back to server proxy if direct download fails.
- */
-export async function downloadFileAuthenticated(
-  fileId: string,
-  fileName: string,
-  token: string | null,
-  opts?: {
-    accountIndex?: number;
-    driveFileId?: string;
-    customPath?: string;
-  }
-): Promise<void> {
-  if (opts?.accountIndex !== undefined && opts?.driveFileId) {
-    try {
-      const tokenRes = await authenticatedFetch(
-        `/api/accounts/${opts.accountIndex}/token`,
-        token
-      );
-      if (tokenRes.ok) {
-        const { accessToken } = await tokenRes.json();
-        const driveRes = await fetch(
-          `https://www.googleapis.com/drive/v3/files/${opts.driveFileId}?alt=media`,
-          { headers: { Authorization: `Bearer ${accessToken}` } }
-        );
-        if (driveRes.ok) {
-          const blob = await driveRes.blob();
-          triggerDownload(blob, fileName);
-          return;
-        }
-      }
-    } catch {
-      // Fall through to proxy
-    }
-  }
+---
 
-  const path = opts?.customPath || `/api/files/${fileId}/download`;
-  const res = await authenticatedFetch(path, token, { method: "POST" });
-  if (!res.ok) throw new Error("Failed to download file");
-  const blob = await res.blob();
-  triggerDownload(blob, fileName);
-}
+## 🟠 High Severity Bugs & Issues
 
-function triggerDownload(blob: Blob, fileName: string): void {
-  const url = window.URL.createObjectURL(blob);
-  const a = document.createElement("a");
-  a.href = url;
-  a.download = fileName;
-  document.body.appendChild(a);
-  a.click();
-  window.URL.revokeObjectURL(url);
-  document.body.removeChild(a);
-}
+---
 
-/**
- * Fetches media and returns a local Object URL.
- * Caller must revoke the URL when done: URL.revokeObjectURL(url)
- */
-export async function fetchMediaBlobUrl(
-  path: string,
-  token: string | null
-): Promise<string> {
-  const res = await authenticatedFetch(path, token, { method: "POST" });
-  if (!res.ok) throw new Error("Failed to fetch media");
-  const blob = await res.blob();
-  return window.URL.createObjectURL(blob);
+### HIGH-01 — Token Endpoint Exposed to All Authenticated Users
+
+**File:** `backend/src/routes/accounts.js`
+
+**Problem:**  
+Any authenticated user can call `GET /api/accounts/:accountIndex/token` for their own accounts, which returns a live Google OAuth access token. Even with ownership checking, this endpoint is the mechanism by which CRIT-01 works — removing this endpoint removes the attack surface.
+
+**Fix:**  
+Remove this endpoint entirely. Redesign sync and download to be backend-proxied. If the endpoint must exist (e.g., for resumable uploads), add strict rate limiting per user and log every token issuance.
+
+---
+
+### HIGH-02 — Race Condition in "Move to Account" — Data Loss Risk
+
+**File:** `frontend/contexts/UploadContext.tsx`
+
+**Problem:**  
+The `moveFile` function follows: download from source → upload to target → delete from source. If the browser tab closes, network drops, or any step fails between upload success and source deletion, the file either exists on both accounts (duplication) or the rollback fails silently and the file is lost.
+
+```typescript
+// Step 6: Can fail AFTER upload succeeded — leaving orphaned file on target
+const deleteRes = await authenticatedFetch(`/api/files/${file.id}`, token, { method: "DELETE" });
+if (!deleteRes.ok) {
+  throw new Error("Source delete failed after upload");
 }
 ```
 
-STEP 8 — Update frontend/contexts/UploadContext.tsx
-Find ALL occurrences of:
-  const creds = localStorage.getItem("credentials");
-And all places where creds is used to set X-Credentials header or inject into body.
-Remove ALL of them. The upload function should use authenticatedFetch() which no
-longer handles credentials at all — the backend does it automatically.
+The rollback code in the catch block also references `targetAccountIndex` which is a function parameter not always defined by that point.
 
-Specifically in the upload() function, replace:
+**Fix:**  
+Implement this as a single backend endpoint (`POST /api/files/:fileId/transfer`) that:
+1. Records a "transfer in progress" state in MongoDB
+2. Performs the operation server-side
+3. Cleans up the in-progress flag on completion or failure
+4. Is idempotent so it can be safely retried
+
+---
+
+### HIGH-03 — No File Size Check Before Browser-Side Move
+
+**File:** `frontend/contexts/UploadContext.tsx`, `frontend/lib/api.ts`
+
+**Problem:**  
+When moving files between accounts, the entire file downloads into browser memory:
+
 ```typescript
-// OLD — remove this entire credentials block:
-const creds = localStorage.getItem("credentials");
-const initRes = await fetch("/api/files/upload/initiate", {
-  method: "POST",
-  headers: {
-    "Content-Type": "application/json",
-    Authorization: `Bearer ${token}`,
-    ...(creds ? { "X-Credentials": creds } : {})
-  },
-  body: JSON.stringify({ ... }),
-});
+const blob = await downloadRes.blob(); // Loads entire file into RAM
 ```
-With:
+
+A 4GB video file would crash the browser tab. There is no size check before attempting this.
+
+**Fix:**  
 ```typescript
-// NEW — use authenticatedFetch, no credentials needed
-const initRes = await authenticatedFetch("/api/files/upload/initiate", token, {
-  method: "POST",
-  body: JSON.stringify({
-    fileName,
-    mimeType: fileType,
-    parentFolderId: parentId,
-    accountIndex: targetAccountIndex,
-  }),
+const contentLength = downloadRes.headers.get("content-length");
+const MAX_BROWSER_MOVE_SIZE = 500 * 1024 * 1024; // 500MB
+if (contentLength && parseInt(contentLength) > MAX_BROWSER_MOVE_SIZE) {
+  throw new Error(
+    "File too large for browser-side transfer (max 500MB). This feature requires a server-side implementation."
+  );
+}
+```
+
+---
+
+### HIGH-04 — Sensitive Data Logged in OAuth Error Handler
+
+**File:** `backend/src/controllers/accountsController.js`
+
+**Problem:**  
+The OAuth callback logs the full Google API error response which can contain token data:
+
+```javascript
+console.error("[OAuth] Callback Processing Error:", {
+  message: err.message,
+  stack: err.stack,
+  code: err.code,
+  response: err.response?.data  // May contain OAuth tokens or sensitive data!
 });
 ```
 
-Do the same for the finalize fetch and all other fetch() calls in UploadContext.tsx
-that currently manually add X-Credentials or read from localStorage.
+**Fix:**  
+```javascript
+console.error("[OAuth] Callback Processing Error:", {
+  message: err.message,
+  code: err.code,
+  httpStatus: err.response?.status, // Only log the status code, not the body
+});
+```
 
-Also in the moveFile() function, remove all:
-  const creds = localStorage.getItem("credentials");
-  ...(creds ? { "X-Credentials": creds } : {})
-And replace raw fetch() calls with authenticatedFetch().
+---
 
-STEP 9 — Update frontend/hooks/useSync.ts
-Remove all references to localStorage credentials. The sync hook should only
-use Clerk tokens. Replace the syncAccount function's token fetch with just
-authenticatedFetch since the backend now handles Google credentials internally.
+### HIGH-05 — Expired Thumbnail URLs Stored in MongoDB
 
-STEP 10 — Update frontend/app/dashboard/settings/page.tsx
-Find the handleRemoveCredentials function and update it to call the backend:
+**File:** `backend/src/services/driveService.js`, `backend/src/models/File.js`
+
+**Problem:**  
+Google Drive `thumbnailLink` URLs expire within hours. These are stored in MongoDB and served to the client later. The thumbnail proxy (`GET /api/files/:fileId/thumbnail`) fetches from the stored URL, which may return 401/403 by the time it is requested.
+
+**Fix:**  
+Do not store `thumbnailLink` long-term. Instead, fetch it fresh from the Drive API on every thumbnail request:
+
+```javascript
+// In filesController.js getThumbnail:
+// Instead of using file.thumbnailLink from DB, fetch fresh:
+const drive = buildService(account, req.clientCredentials);
+const meta = await drive.files.get({ fileId: file.driveFileId, fields: "thumbnailLink" });
+const freshUrl = meta.data.thumbnailLink;
+if (!freshUrl) return res.status(404).json({ detail: "No thumbnail" });
+```
+
+---
+
+### HIGH-06 — localStorage Sync Lock is Not Atomic (Race Condition)
+
+**File:** `frontend/hooks/useSync.ts`
+
+**Problem:**  
+The sync lock uses `localStorage` as a cross-tab mutex, but `localStorage.getItem` + `localStorage.setItem` is not atomic. Two tabs can simultaneously read "no lock" and both acquire it, causing duplicate sync operations.
+
 ```typescript
-async function handleRemoveCredentials() {
-  confirm("Remove stored credentials?", async () => {
-    const token = await getToken();
-    await authenticatedFetch("/api/credentials", token, { method: "DELETE" });
-    toast("Credentials removed successfully.", "success");
-    setTimeout(() => window.location.reload(), 1500);
-  }, {
-    description: "This will permanently delete your Google Cloud credentials from the server. You will need to re-upload them to use StitchDrive features.",
-    confirmLabel: "Remove Credentials",
-    danger: true,
-  });
+const rawLock = window.localStorage.getItem(SYNC_LOCK_KEY);
+// <<< Another tab can read here before this tab writes >>>
+window.localStorage.setItem(SYNC_LOCK_KEY, JSON.stringify({ tabId: ..., timestamp: now }));
+```
+
+**Fix:**  
+Use the `BroadcastChannel` API for proper tab coordination. Alternatively, since the sync operation is idempotent (uses `bulkWrite` with `upsert`), simply remove the lock mechanism and accept that duplicate syncs may occasionally occur — the data consistency is maintained by MongoDB.
+
+---
+
+### HIGH-07 — No Frontend Validation on Rename Input
+
+**File:** `frontend/components/files/FileCards.tsx`
+
+**Problem:**  
+The rename input commits on `blur` with no client-side validation. If the user accidentally clicks away, any text in the box (including empty string after selecting all and typing nothing) triggers a rename API call.
+
+```typescript
+// Commits on blur — no validation
+async function commitRename() {
+  const trimmed = editName.trim();
+  if (trimmed && trimmed !== file.file_name) await onRename(file.id, trimmed);
+  // Empty string check only — no length or character validation
 }
 ```
 
-Also update the hasCredentials check in frontend/app/dashboard/page.tsx:
-Remove the localStorage check and replace with an API call:
+**Fix:**  
+```typescript
+async function commitRename() {
+  const trimmed = editName.trim();
+  setEditing(false);
+  if (!trimmed || trimmed === file.file_name) {
+    setEditName(file.file_name);
+    return;
+  }
+  if (trimmed.length > 255 || /[\/\\\0\u0000-\u001f]/.test(trimmed)) {
+    setEditName(file.file_name);
+    toast("Invalid file name — contains illegal characters", "error");
+    return;
+  }
+  await onRename(file.id, trimmed);
+}
+```
+
+---
+
+## 🟡 Medium Severity Issues
+
+---
+
+### MED-01 — Rate Limiter IP Can Be Spoofed
+
+**File:** `backend/src/middlewares/rateLimiters.js`, `backend/src/index.js`
+
+**Problem:**  
+`app.set("trust proxy", 1)` blindly trusts the first proxy hop. If the app is deployed without a proper reverse proxy in front of it (or if `X-Forwarded-For` is not stripped by the proxy), clients can spoof their IP to bypass rate limits on the login endpoint.
+
+**Fix:**  
+Configure trusted proxy IPs explicitly if known. For `loginLimiter`, add user-agent fingerprinting as a secondary key. Consider using `express-slow-down` as a softer rate limiter in addition to hard limits.
+
+---
+
+### MED-02 — Missing Content-Security-Policy Header
+
+**File:** `backend/src/index.js`
+
+**Problem:**  
+`helmet()` is used with default settings. Without a strict CSP, any XSS vulnerability would allow full script execution with no browser-level containment. The app loads external resources (Google Fonts, Clerk, Google APIs) that should be explicitly whitelisted.
+
+**Fix:**  
+```javascript
+app.use(helmet({
+  contentSecurityPolicy: {
+    directives: {
+      defaultSrc: ["'self'"],
+      scriptSrc: ["'self'", "https://clerk.com", "https://*.clerk.accounts.dev"],
+      connectSrc: ["'self'", "https://www.googleapis.com", "https://api.clerk.com"],
+      imgSrc: ["'self'", "data:", "https://lh3.googleusercontent.com", "https://lh4.googleusercontent.com"],
+      fontSrc: ["'self'", "https://fonts.googleapis.com", "https://fonts.gstatic.com"],
+      styleSrc: ["'self'", "'unsafe-inline'", "https://fonts.googleapis.com"],
+    }
+  }
+}));
+```
+
+---
+
+### MED-03 — All Files Loaded into Memory on Every Page Load
+
+**File:** `frontend/hooks/useFiles.ts`
+
+**Problem:**  
+The files hook fetches all files with `limit=1000` (the default cap) on every mount:
+
+```typescript
+const res = await authenticatedFetch("/api/files", token); // 1000 files max, no pagination
+```
+
+For a user with 10 Drive accounts each containing 1,000 files, this would attempt to load 10,000 files into the browser state on every dashboard visit.
+
+**Fix:**  
+Implement pagination or infinite scroll in the Files page. The backend supports `page` and `limit` parameters — wire them up in the frontend. Start with 100 files per page.
+
+---
+
+### MED-04 — Blob URL Memory Leaks in Async Components
+
+**File:** `frontend/components/AuthenticatedThumbnail.tsx`, `frontend/components/files/PreviewModal.tsx`
+
+**Problem:**  
+`URL.createObjectURL()` blobs are not reliably revoked when components unmount mid-fetch. If a user navigates away while 50 thumbnails are loading, none of the in-flight blob URLs get revoked.
+
+**Fix:**  
+Use `AbortController` to cancel in-flight requests on unmount, and ensure cleanup runs regardless of the `active` flag:
+
 ```typescript
 useEffect(() => {
-  const checkCreds = async () => {
-    const token = await getToken();
-    const res = await authenticatedFetch("/api/credentials/status", token);
-    if (res.ok) {
-      const data = await res.json();
-      setHasCredentials(data.hasCredentials);
-    }
-  };
-  checkCreds();
-}, [getToken]);
-```
+  const controller = new AbortController();
+  let blobUrl = "";
 
-================================================================================
-FIX #2 — CRITICAL SECURITY: Validate and restrict thumbnail proxy URLs (SSRF)
-================================================================================
-
-PROBLEM:
-- File: backend/src/controllers/filesController.js — getThumbnail() function
-- The thumbnailLink stored in MongoDB is fetched directly without URL validation
-- An attacker who can write to the DB could make the server fetch internal URLs
-
-SOLUTION:
-In backend/src/controllers/filesController.js, find the getThumbnail function.
-Add URL validation BEFORE the fetch call. Insert this helper at the top of the
-file (after imports):
-```javascript
-const SAFE_THUMBNAIL_HOSTS = [
-  'lh3.googleusercontent.com',
-  'lh4.googleusercontent.com',
-  'lh5.googleusercontent.com',
-  'lh6.googleusercontent.com',
-  'drive.google.com',
-  'docs.google.com',
-];
-
-function isSafeThumbnailUrl(urlString) {
-  try {
-    const parsed = new URL(urlString);
-    if (parsed.protocol !== 'https:') return false;
-    return SAFE_THUMBNAIL_HOSTS.some(host =>
-      parsed.hostname === host || parsed.hostname.endsWith('.' + host)
-    );
-  } catch {
-    return false;
-  }
-}
-```
-
-Then in getThumbnail(), replace:
-```javascript
-// OLD:
-try {
-  const response = await fetch(file.thumbnailLink);
-```
-With:
-```javascript
-// NEW:
-if (!isSafeThumbnailUrl(file.thumbnailLink)) {
-  return res.status(400).json({ detail: "Invalid thumbnail URL" });
-}
-
-const controller = new AbortController();
-const timeoutId = setTimeout(() => controller.abort(), 5000);
-
-try {
-  const response = await fetch(file.thumbnailLink, { signal: controller.signal });
-  clearTimeout(timeoutId);
-```
-
-Also add clearTimeout in the catch block:
-```javascript
-} catch (err) {
-  clearTimeout(timeoutId);
-  console.error(`[Thumbnail] Error for file ${file.driveFileId}:`, err.message);
-  return res.status(502).json({ detail: "Error fetching thumbnail proxy" });
-}
-```
-
-================================================================================
-FIX #3 — CRITICAL SECURITY: Sign the OAuth state parameter
-================================================================================
-
-PROBLEM:
-- File: backend/src/controllers/accountsController.js
-- The state parameter is plain base64 JSON containing ownerId and accountIndex
-- An attacker can craft a state that links their OAuth code to a different user
-
-SOLUTION:
-Add STATE_SECRET to your .env files:
-  backend/.env: STATE_SECRET=<generate with: node -e "console.log(require('crypto').randomBytes(32).toString('hex'))">
-
-In backend/src/controllers/accountsController.js, add these two helpers
-at the TOP of the file, after imports:
-```javascript
-import crypto from "crypto";
-
-function createSignedState(payload) {
-  const data = JSON.stringify(payload);
-  const sig = crypto
-    .createHmac("sha256", process.env.STATE_SECRET || "fallback-change-me")
-    .update(data)
-    .digest("hex");
-  return Buffer.from(JSON.stringify({ data, sig })).toString("base64url");
-}
-
-function verifySignedState(stateB64) {
-  const decoded = JSON.parse(Buffer.from(stateB64, "base64url").toString("utf-8"));
-  const { data, sig } = decoded;
-  const expectedSig = crypto
-    .createHmac("sha256", process.env.STATE_SECRET || "fallback-change-me")
-    .update(data)
-    .digest("hex");
-  if (!crypto.timingSafeEqual(Buffer.from(sig, "hex"), Buffer.from(expectedSig, "hex"))) {
-    throw new Error("Invalid state signature");
-  }
-  return JSON.parse(data);
-}
-```
-
-In getNewOAuthUrl(), replace:
-```javascript
-// OLD:
-const state = Buffer.from(JSON.stringify({ ownerId, accountIndex: newIndex })).toString("base64");
-```
-With:
-```javascript
-// NEW:
-const state = createSignedState({ ownerId, accountIndex: newIndex });
-```
-
-In getOAuthUrl(), replace the same pattern.
-
-In oauthCallback(), replace:
-```javascript
-// OLD:
-try {
-  stateObj = JSON.parse(Buffer.from(state, "base64").toString("utf-8"));
-} catch (err) {
-  return res.redirect(`${config.FRONTEND_URL}/dashboard/settings?error=oauth_invalid`);
-}
-```
-With:
-```javascript
-// NEW:
-try {
-  stateObj = verifySignedState(state);
-} catch (err) {
-  console.warn("[OAuth] State verification failed:", err.message);
-  return res.redirect(`${config.FRONTEND_URL}/dashboard/settings?error=oauth_invalid`);
-}
-```
-
-================================================================================
-FIX #4 — CRITICAL SECURITY: Move encryption key out of database
-================================================================================
-
-PROBLEM:
-- File: backend/src/utils/configLoader.js
-- File: backend/src/config/index.js
-- The ENCRYPTION_KEY is stored in MongoDB. If DB is breached, all tokens exposed.
-
-SOLUTION:
-Add ENCRYPTION_KEY to your environment variables instead of DB:
-  backend/.env: ENCRYPTION_KEY=<generate with: node -e "console.log(require('crypto').randomBytes(32).toString('base64'))">
-
-Replace backend/src/utils/configLoader.js entirely with:
-```javascript
-import { setSecrets } from "../config/index.js";
-
-export async function loadSecretsFromDB() {
-  const encryptionKey = process.env.ENCRYPTION_KEY;
-  if (!encryptionKey) {
-    console.error("[Config] ENCRYPTION_KEY environment variable is not set.");
-    process.exit(1);
-  }
-
-  // Validate key length (must decode to 32 bytes for Fernet AES-128)
-  try {
-    const raw = Buffer.from(encryptionKey, "base64");
-    if (raw.length !== 32) {
-      console.error("[Config] ENCRYPTION_KEY must be exactly 32 bytes (base64 encoded).");
-      process.exit(1);
-    }
-  } catch {
-    console.error("[Config] ENCRYPTION_KEY is not valid base64.");
-    process.exit(1);
-  }
-
-  setSecrets({ encryption_key: encryptionKey });
-  console.log("[Config] Encryption key loaded from environment.");
-}
-```
-
-Note: The function name loadSecretsFromDB is kept for compatibility since it is
-called in backend/src/index.js. No other files need to change.
-
-================================================================================
-FIX #5 — HIGH: Fix memory leak in AuthenticatedThumbnail component
-================================================================================
-
-PROBLEM:
-- File: frontend/components/AuthenticatedThumbnail.tsx
-- The cleanup function captures blobUrl at closure creation time
-- If component unmounts before async resolution, revokeObjectURL may not fire
-
-SOLUTION:
-Replace the entire useEffect in AuthenticatedThumbnail.tsx with:
-```typescript
-useEffect(() => {
-  if (!inView) return;
-
-  let active = true;
-  let allocatedUrl = "";
-
-  const loadThumb = async () => {
+  const load = async () => {
     try {
-      const token = await getToken();
-      const url = await fetchMediaBlobUrl(`/api/files/${fileId}/thumbnail`, token);
-      if (active) {
-        allocatedUrl = url;
-        setUrl(url);
-      } else {
-        // Component unmounted before we could use it — revoke immediately
-        URL.revokeObjectURL(url);
-      }
-    } catch {
-      if (active) setError(true);
+      const res = await fetch(url, { signal: controller.signal });
+      blobUrl = URL.createObjectURL(await res.blob());
+      setUrl(blobUrl);
+    } catch (e) {
+      if (!controller.signal.aborted) setError(true);
     }
   };
 
-  loadThumb();
-
+  load();
   return () => {
-    active = false;
-    if (allocatedUrl) {
-      URL.revokeObjectURL(allocatedUrl);
-      allocatedUrl = "";
-    }
+    controller.abort();
+    if (blobUrl) URL.revokeObjectURL(blobUrl);
   };
-}, [fileId, getToken, inView]);
+}, [fileId]);
 ```
 
-================================================================================
-FIX #6 — HIGH: Fix infinite interval reset in useSync hook
-================================================================================
+---
 
-PROBLEM:
-- File: frontend/hooks/useSync.ts
-- The auto-sync interval depends on [syncAll] which changes reference frequently
-- This causes the 5-minute interval to reset repeatedly
+### MED-05 — OAuth `ownerId` Exposed in Browser History via URL State
 
-SOLUTION:
-In frontend/hooks/useSync.ts, find the useEffect with setInterval and replace it:
-```typescript
-// Add this import at top if not present:
-import { useCallback, useState, useEffect, useRef } from "react";
+**File:** `backend/src/controllers/accountsController.js`
 
-// Add this ref inside the useSync function, before the useEffect:
-const syncAllRef = useRef(syncAll);
-useEffect(() => {
-  syncAllRef.current = syncAll;
-}, [syncAll]);
+**Problem:**  
+The OAuth state parameter (which appears in the browser URL during the OAuth flow) contains the user's Clerk `ownerId` base64-encoded. This ends up in browser history, server access logs, and any analytics tools that capture full URLs.
 
-// Replace the existing interval useEffect with:
-useEffect(() => {
-  const interval = setInterval(() => {
-    syncAllRef.current();
-  }, 5 * 60_000);
-  return () => clearInterval(interval);
-}, []); // Empty array — interval is created once and never reset
+```javascript
+const payload = Buffer.from(
+  JSON.stringify({ ownerId, accountIndex, issuedAt: Date.now() })
+).toString("base64url"); // ownerId visible in URL
 ```
 
-================================================================================
-FIX #7 — HIGH: Add rollback to file move operation
-================================================================================
+**Fix:**  
+Store the OAuth state in a short-lived MongoDB document and use a random opaque token as the URL parameter:
 
-PROBLEM:
-- File: frontend/contexts/UploadContext.tsx — moveFile() function
-- If delete from source fails after successful upload to target, file is duplicated
+```javascript
+const stateToken = crypto.randomBytes(32).toString("hex");
+await OAuthState.create({ token: stateToken, ownerId, accountIndex, expiresAt: new Date(Date.now() + 10 * 60000) });
+// Use stateToken in the URL, look up ownerId from DB in callback
+```
 
-SOLUTION:
-In the moveFile() function inside UploadContext.tsx, find Step 6 (the delete step)
-and replace that section with:
+---
+
+### MED-06 — `@ts-ignore` Suppresses Real Type Errors
+
+**File:** `frontend/app/sign-up/page.tsx`
+
+**Problem:**  
 ```typescript
-// Step 6: Delete from source account — with rollback on failure
-setSnacks((s) => s.map((sn) => (sn.id === id ? { ...sn, name: `[3/3] Deleting Source: ${fileName}`, progress: 95 } : sn)));
+// @ts-ignore
+const { signUp, fetchStatus, setActive } = useSignUp();
+```
 
-let deleteSuccess = false;
-try {
-  const deleteRes = await authenticatedFetch(`/api/files/${file.id}`, token, {
-    method: "DELETE",
+This suppresses a real TypeScript error related to Clerk's API types. `skipLibCheck: true` in `tsconfig.json` compounds this. These suppressions can hide breaking changes when dependencies update.
+
+**Fix:**  
+Use the proper Clerk types:
+```typescript
+const { signUp, isLoaded, setActive } = useSignUp();
+if (!isLoaded) return null;
+```
+
+---
+
+### MED-07 — No Graceful Shutdown on SIGTERM
+
+**File:** `backend/src/index.js`
+
+**Problem:**  
+When Docker stops the container (`docker stop`), it sends SIGTERM. Without a handler, the process exits immediately, potentially:
+- Abandoning in-progress MongoDB writes
+- Cutting off active file streaming connections mid-download
+- Losing upload state for ongoing Google Drive operations
+
+**Fix:**  
+```javascript
+const server = app.listen(PORT, "0.0.0.0", () => { ... });
+
+const shutdown = async (signal) => {
+  console.log(`[Server] ${signal} received. Shutting down gracefully...`);
+  server.close(async () => {
+    await mongoose.connection.close();
+    console.log("[Server] MongoDB disconnected. Exiting.");
+    process.exit(0);
   });
-  if (deleteRes.ok || deleteRes.status === 204 || deleteRes.status === 404) {
-    deleteSuccess = true;
-  } else {
-    throw new Error(`Delete returned status ${deleteRes.status}`);
-  }
-} catch (deleteErr: any) {
-  console.error("[Move] Source delete failed, attempting rollback:", deleteErr.message);
-  // Rollback: delete the file we just uploaded to the target account
-  try {
-    await authenticatedFetch(`/api/files/upload/finalize`, token, {
-      method: "DELETE", // This won't exist but we can trash the drive file directly
-    });
-    // Best-effort: trash the newly uploaded file on target
-    const trashRes = await fetch(
-      `https://www.googleapis.com/drive/v3/files/${driveFileId}`,
-      {
-        method: "DELETE",
-        headers: { Authorization: `Bearer ${(await authenticatedFetch(`/api/accounts/${targetAccountIndex}/token`, token).then(r => r.json())).accessToken}` },
-      }
-    );
-    console.log("[Move] Rollback trash status:", trashRes.status);
-  } catch (rollbackErr: any) {
-    console.error("[Move] Rollback also failed:", rollbackErr.message);
-  }
-  throw new Error(`Move failed: could not delete source file. Your file may be duplicated. Please check both accounts.`);
-}
+  // Force exit after 30s
+  setTimeout(() => process.exit(1), 30000);
+};
+
+process.on("SIGTERM", () => shutdown("SIGTERM"));
+process.on("SIGINT", () => shutdown("SIGINT"));
 ```
 
-================================================================================
-FIX #8 — MEDIUM: Add filename validation in rename endpoint
-================================================================================
+---
 
-PROBLEM:
-- File: backend/src/controllers/filesController.js — rename() function
-- No validation on the new_name field — allows path traversal chars, null bytes
+### MED-08 — Multi-Tab Auto-Sync Causes API Flood
 
-SOLUTION:
-In backend/src/controllers/filesController.js, find the rename() function.
-Replace the existing newName validation block:
-```javascript
-// OLD:
-const newName = req.body.new_name?.trim();
-if (!newName) {
-  return res.status(400).json({ detail: "new_name is required and cannot be empty" });
-}
-```
+**File:** `frontend/hooks/useSync.ts`
 
-With:
-```javascript
-// NEW:
-const newName = req.body.new_name?.trim();
-if (!newName) {
-  return res.status(400).json({ detail: "new_name is required and cannot be empty" });
-}
+**Problem:**  
+Every open browser tab runs its own 30-minute sync timer. A user with 5 tabs open generates 5× the Google API calls and backend load. The localStorage lock is not atomic (HIGH-06) so all 5 may run concurrently.
 
-// Reject names that are too long
-if (newName.length > 255) {
-  return res.status(400).json({ detail: "File name cannot exceed 255 characters" });
-}
+**Fix:**  
+Use the `BroadcastChannel` API to elect one leader tab:
 
-// Reject path traversal and shell-injection characters
-const INVALID_NAME_REGEX = /[<>:"/\\|?*\x00-\x1f]/;
-if (INVALID_NAME_REGEX.test(newName)) {
-  return res.status(400).json({ detail: "File name contains invalid characters" });
-}
-
-// Reject reserved names (Windows compatibility)
-const RESERVED_NAMES = /^(CON|PRN|AUX|NUL|COM[1-9]|LPT[1-9])(\.|$)/i;
-if (RESERVED_NAMES.test(newName)) {
-  return res.status(400).json({ detail: "File name is reserved" });
-}
-```
-
-================================================================================
-FIX #9 — MEDIUM: Add rate limiting to file operation routes
-================================================================================
-
-PROBLEM:
-- File: backend/src/routes/files.js
-- File: backend/src/routes/accounts.js
-- Only OAuth routes are rate limited; all file endpoints are unprotected
-
-SOLUTION:
-Create a new file: backend/src/middlewares/rateLimiters.js
-```javascript
-import { rateLimit } from "express-rate-limit";
-
-// General API limiter: 200 requests per minute per user
-export const apiLimiter = rateLimit({
-  windowMs: 60 * 1000,
-  max: 200,
-  standardHeaders: true,
-  legacyHeaders: false,
-  keyGenerator: (req) => req.ownerId || req.ip,
-  message: { detail: "Too many requests. Please slow down." },
-  skip: (req) => req.method === "GET" && req.path.includes("/thumbnail"), // thumbnails excluded
-});
-
-// Download limiter: 60 downloads per minute per user
-export const downloadLimiter = rateLimit({
-  windowMs: 60 * 1000,
-  max: 60,
-  standardHeaders: true,
-  legacyHeaders: false,
-  keyGenerator: (req) => req.ownerId || req.ip,
-  message: { detail: "Download rate limit exceeded. Please wait." },
-});
-
-// Upload limiter: 30 uploads per minute per user
-export const uploadLimiter = rateLimit({
-  windowMs: 60 * 1000,
-  max: 30,
-  standardHeaders: true,
-  legacyHeaders: false,
-  keyGenerator: (req) => req.ownerId || req.ip,
-  message: { detail: "Upload rate limit exceeded. Please wait." },
-});
-```
-
-In backend/src/routes/files.js, add at the top:
-```javascript
-import { apiLimiter, downloadLimiter, uploadLimiter } from "../middlewares/rateLimiters.js";
-```
-
-Then add limiters to specific routes. Find the route definitions and add:
-```javascript
-// Add apiLimiter to the main router:
-router.use(requireAuth, apiLimiter); // applies to all routes in this file
-
-// Add specific limiters:
-router.get("/:fileId/download", downloadLimiter, getDownload);
-router.post("/:fileId/download", downloadLimiter, getDownload);
-router.get("/:fileId/view", downloadLimiter, getView);
-router.post("/:fileId/view", downloadLimiter, getView);
-router.post("/upload/initiate", uploadLimiter, initiateUpload);
-router.post("/upload/finalize", uploadLimiter, finalizeUpload);
-```
-
-Note: requireAuth must come before these limiters in the middleware chain since
-keyGenerator uses req.ownerId which is set by requireAuth.
-
-================================================================================
-FIX #10 — MEDIUM: Fix OAuth2 client cache — add size limit and TTL
-================================================================================
-
-PROBLEM:
-- File: backend/src/services/driveService.js
-- _oauth2Cache and _quotaCache are plain Maps that grow without bound
-
-SOLUTION:
-In backend/src/services/driveService.js, find the cache declarations at the top
-and replace the entire cache setup section with:
-```javascript
-// ── Simple TTL + LRU Cache ─────────────────────────────────────────────────
-class BoundedTTLCache {
-  constructor(maxSize = 500, ttlMs = 30 * 60_000) {
-    this._map = new Map();
-    this._maxSize = maxSize;
-    this._ttlMs = ttlMs;
-  }
-
-  get(key) {
-    const entry = this._map.get(key);
-    if (!entry) return undefined;
-    if (Date.now() > entry.expiresAt) {
-      this._map.delete(key);
-      return undefined;
-    }
-    // Move to end (most recently used)
-    this._map.delete(key);
-    this._map.set(key, entry);
-    return entry.value;
-  }
-
-  set(key, value) {
-    if (this._map.has(key)) this._map.delete(key);
-    else if (this._map.size >= this._maxSize) {
-      // Evict oldest (first) entry
-      this._map.delete(this._map.keys().next().value);
-    }
-    this._map.set(key, { value, expiresAt: Date.now() + this._ttlMs });
-  }
-
-  delete(key) {
-    this._map.delete(key);
-  }
-
-  clear() {
-    this._map.clear();
-  }
-}
-
-// OAuth2 clients cached for 60 minutes, max 500 entries
-const _oauth2Cache = new BoundedTTLCache(500, 60 * 60_000);
-
-// Quota data cached for 5 minutes, max 500 entries
-const _quotaCache = new BoundedTTLCache(500, QUOTA_CACHE_TTL_MS);
-```
-
-Then update the cache usage. The existing getOAuth2Client() uses:
-  _oauth2Cache.get(cacheKey) — this now returns undefined instead of null when missing
-  _oauth2Cache.set(cacheKey, { client, hash })
-
-Change the check in getOAuth2Client():
-```javascript
-// OLD:
-const cached = _oauth2Cache.get(cacheKey);
-if (cached && cached.hash === credsHash) return cached.client;
-```
-Keep as-is — undefined is falsy so the if check still works correctly.
-
-Also update invalidateOAuth2Cache and invalidateQuotaCache — they call
-.delete() and .clear() which the new class supports the same way.
-Also update getCachedQuota and setCachedQuota to use the new cache:
-```javascript
-function getCachedQuota(ownerId, accountIndex) {
-  return _quotaCache.get(`${ownerId}_${accountIndex}`) ?? null;
-}
-
-function setCachedQuota(ownerId, accountIndex, data) {
-  _quotaCache.set(`${ownerId}_${accountIndex}`, data);
-}
-```
-Remove the old manual expiresAt logic since TTL is now handled by the cache class.
-
-================================================================================
-FIX #11 — MEDIUM: Add React Error Boundary to dashboard
-================================================================================
-
-PROBLEM:
-- File: frontend/app/dashboard/layout.tsx
-- No error boundary — any unhandled error crashes the entire dashboard
-
-SOLUTION:
-Create new file: frontend/components/DashboardErrorBoundary.tsx
 ```typescript
-"use client";
-
-import React from "react";
-
-interface State {
-  hasError: boolean;
-  errorMessage: string;
-}
-
-export class DashboardErrorBoundary extends React.Component
-  { children: React.ReactNode },
-  State
-> {
-  constructor(props: { children: React.ReactNode }) {
-    super(props);
-    this.state = { hasError: false, errorMessage: "" };
-  }
-
-  static getDerivedStateFromError(error: Error): State {
-    return { hasError: true, errorMessage: error.message };
-  }
-
-  componentDidCatch(error: Error, info: React.ErrorInfo) {
-    console.error("[ErrorBoundary] Caught error:", error, info);
-  }
-
-  render() {
-    if (this.state.hasError) {
-      return (
-        <div className="flex h-full flex-col items-center justify-center gap-4 p-8 text-center">
-          <div className="flex h-16 w-16 items-center justify-center rounded-2xl bg-rose-500/10 border border-rose-500/20">
-            <svg className="h-8 w-8 text-rose-400" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={1.5}>
-              <path strokeLinecap="round" strokeLinejoin="round" d="M12 9v3.75m-9.303 3.376c-.866 1.5.217 3.374 1.948 3.374h14.71c1.73 0 2.813-1.874 1.948-3.374L13.949 3.378c-.866-1.5-3.032-1.5-3.898 0L2.697 16.126ZM12 15.75h.007v.008H12v-.008Z" />
-            </svg>
-          </div>
-          <div>
-            <h2 className="text-lg font-bold text-sd-text">Something went wrong</h2>
-            <p className="mt-1 text-sm text-sd-text3 max-w-sm">
-              An unexpected error occurred. Please refresh the page.
-            </p>
-            {this.state.errorMessage && (
-              <p className="mt-2 text-xs font-mono text-rose-400 bg-rose-500/5 rounded-lg px-3 py-2 max-w-sm">
-                {this.state.errorMessage}
-              </p>
-            )}
-          </div>
-          <button
-            onClick={() => window.location.reload()}
-            className="btn-primary rounded-xl px-6 py-2.5 text-sm font-semibold"
-          >
-            Reload Page
-          </button>
-        </div>
-      );
-    }
-    return this.props.children;
-  }
-}
+const channel = new BroadcastChannel("stitchdrive-sync");
+// Only the tab that wins the leader election runs sync
+// Others listen for "sync-complete" events and refresh their file list
 ```
 
-In frontend/app/dashboard/layout.tsx, import and wrap children:
+---
+
+### MED-09 — Fake OpenGraph URL and Missing SEO Configuration
+
+**File:** `frontend/app/layout.tsx`
+
+**Problem:**  
 ```typescript
-import { DashboardErrorBoundary } from "@/components/DashboardErrorBoundary";
-
-// In the JSX, wrap the main content area:
-<main id="dp-scroll" className="flex-1 overflow-y-auto p-4 lg:p-8">
-  <DashboardErrorBoundary>
-    <Suspense fallback={<Loading />}>
-      {children}
-    </Suspense>
-  </DashboardErrorBoundary>
-</main>
+url: "https://stitchdrive.example.com", // This is a placeholder!
 ```
 
-================================================================================
-FIX #12 — MEDIUM: Fix stale re-render dependency in files page
-================================================================================
+Social sharing links will reference a non-existent domain. Also, `robots.txt` is missing, meaning search engines have no guidance on what to index.
 
-PROBLEM:
-- File: frontend/app/dashboard/files/page.tsx
-- The useEffect that calls setCurrentFolder uses object reference as dependency
-
-SOLUTION:
-In frontend/app/dashboard/files/page.tsx, find:
+**Fix:**  
 ```typescript
-// OLD:
-useEffect(() => {
-  setCurrentFolder(currentFolder.id, currentFolder.id ? currentFolder.name : null);
-}, [currentFolder, setCurrentFolder]);
+// layout.tsx
+url: process.env.NEXT_PUBLIC_APP_URL ?? "https://your-actual-domain.com",
 ```
+Add a `robots.txt` and `sitemap.xml` in the `public/` directory.
 
-Replace with:
+---
+
+## 🔵 Low Severity / Code Quality Issues
+
+---
+
+### LOW-01 — Dead Code: Multiple Unused Components
+
+**Files:**
+- `frontend/components/UploadZone.tsx` — uses old unauthenticated upload API
+- `frontend/components/StorageBar.tsx` — replaced by sidebar storage widget
+- `frontend/components/FileList.tsx` — replaced by `files/FileCards.tsx`
+- `frontend/components/AccountCard.tsx` — appears unused in current routes
+- `frontend/test_clerk.js` — debugging file committed to repo
+
+**Fix:**  
+Delete all of the above. Run a dead code analysis with a tool like `ts-prune` or `knip` to catch any others.
+
+---
+
+### LOW-02 — `console.log`/`console.error` Scattered Throughout Production Code
+
+**Files:** `frontend/contexts/UploadContext.tsx`, `frontend/components/Navbar.tsx`, `frontend/hooks/useSync.ts`, multiple others
+
+**Problem:**  
 ```typescript
-// NEW — use primitive values as dependencies, not the object:
-const currentFolderId = currentFolder.id;
-const currentFolderName = currentFolder.name;
-
-useEffect(() => {
-  setCurrentFolder(currentFolderId, currentFolderId ? currentFolderName : null);
-}, [currentFolderId, currentFolderName, setCurrentFolder]);
+console.error("[Upload] Critical Error:", err.message);
+console.error("[Move] Progress Error:", err.message);
+console.error("[Navbar] Fetch profile error:", err);
 ```
 
-================================================================================
-FIX #13 — MEDIUM: Fix drag counter going negative
-================================================================================
+These leak internal details to any user with DevTools open and add noise to log aggregators.
 
-PROBLEM:
-- File: frontend/contexts/UploadContext.tsx
-- dragCounter can go negative, breaking subsequent drag-and-drop interactions
-
-SOLUTION:
-In frontend/contexts/UploadContext.tsx, find the drag event handlers inside
-the useEffect and replace onDragLeave:
-```javascript
-// OLD:
-function onDragLeave(e: DragEvent) {
-  const types = Array.from(e.dataTransfer?.types || []);
-  if (!types.includes("Files")) return;
-  dragCounter.current--;
-  if (dragCounter.current <= 0) {
-    dragCounter.current = 0;
-    setDragging(false);
-  }
-}
-```
-
-With:
-```javascript
-// NEW — same but guaranteed non-negative:
-function onDragLeave(e: DragEvent) {
-  const types = Array.from(e.dataTransfer?.types || []);
-  if (!types.includes("Files")) return;
-  dragCounter.current = Math.max(0, dragCounter.current - 1);
-  if (dragCounter.current === 0) setDragging(false);
-}
-```
-
-Also add a window blur handler to reset state if user drags file out of window:
-```javascript
-// Add inside the same useEffect, before the return statement:
-function onWindowBlur() {
-  dragCounter.current = 0;
-  setDragging(false);
-}
-window.addEventListener("blur", onWindowBlur);
-
-// Add to the cleanup return:
-return () => {
-  window.removeEventListener("dragenter", onDragEnter);
-  window.removeEventListener("dragleave", onDragLeave);
-  window.removeEventListener("dragover", onDragOver);
-  window.removeEventListener("drop", onDrop);
-  window.removeEventListener("blur", onWindowBlur); // ADD THIS LINE
+**Fix:**  
+Create a logger utility:
+```typescript
+// lib/logger.ts
+const isDev = process.env.NODE_ENV === "development";
+export const logger = {
+  error: (...args: unknown[]) => isDev && console.error(...args),
+  warn: (...args: unknown[]) => isDev && console.warn(...args),
+  info: (...args: unknown[]) => isDev && console.log(...args),
 };
 ```
 
-================================================================================
-FIX #14 — PERFORMANCE: Add pagination to file listing endpoint
-================================================================================
+---
 
-PROBLEM:
-- File: backend/src/controllers/filesController.js — listFiles()
-- All files are fetched at once with no limit; bad for users with 1000+ files
+### LOW-03 — `BoundedTTLCache` Expired Entries Waste Memory Until Evicted
 
-SOLUTION:
-In backend/src/controllers/filesController.js, replace the listFiles function:
+**File:** `backend/src/utils/BoundedTTLCache.js`
+
+**Problem:**  
+Expired entries are only removed when accessed via `get()`. Entries that are set but never read again sit in the cache indefinitely until the `maxEntries` limit forces LRU eviction. In a server running for days, this can accumulate stale OAuth client caches.
+
+**Fix:**  
+Add periodic cleanup:
 ```javascript
-export async function listFiles(req, res) {
-  const ownerId = req.ownerId;
-  const page = Math.max(1, parseInt(req.query.page) || 1);
-  const limit = Math.min(Math.max(1, parseInt(req.query.limit) || 200), 1000);
-  const skip = (page - 1) * limit;
-
-  const connected = await DriveAccount.find({ ownerId, isConnected: true })
-    .select("accountIndex")
-    .lean();
-  const connectedIndices = connected.map((a) => a.accountIndex);
-
-  const query = { ownerId, accountIndex: { $in: connectedIndices } };
-
-  const [files, total] = await Promise.all([
-    File.find(query)
-      .sort({ createdAt: -1 })
-      .skip(skip)
-      .limit(limit)
-      .lean(),
-    File.countDocuments(query),
-  ]);
-
-  res.setHeader("X-Total-Count", total);
-  res.setHeader("X-Page", page);
-  res.setHeader("X-Limit", limit);
-
-  return res.json(files.map(fileToDict));
+constructor(maxEntries = 500, ttlMs = 300_000) {
+  // ... existing code ...
+  setInterval(() => this._cleanup(), Math.min(ttlMs, 60_000)).unref();
 }
-```
 
-Note: The frontend currently fetches all files at once in useFiles.ts.
-For now, set the default limit to 1000 to maintain current behavior while
-enabling pagination capability. Future work: implement virtual scrolling
-on the frontend and fetch pages as the user scrolls.
-
-================================================================================
-FIX #15 — PERFORMANCE: Add timeout to all external HTTP fetches
-================================================================================
-
-PROBLEM:
-- File: backend/src/controllers/filesController.js — multiple fetch() calls
-- File: backend/src/services/driveService.js — downloadFile()
-- No timeouts means a slow Google CDN can hang the Node.js process
-
-SOLUTION:
-Create a utility: backend/src/utils/fetchWithTimeout.js
-```javascript
-/**
- * Wraps fetch() with an AbortController-based timeout.
- * @param {string} url
- * @param {RequestInit} options
- * @param {number} timeoutMs - default 10 seconds
- */
-export async function fetchWithTimeout(url, options = {}, timeoutMs = 10_000) {
-  const controller = new AbortController();
-  const timeoutId = setTimeout(() => controller.abort(), timeoutMs);
-
-  try {
-    const response = await fetch(url, {
-      ...options,
-      signal: controller.signal,
-    });
-    return response;
-  } finally {
-    clearTimeout(timeoutId);
+_cleanup() {
+  const now = Date.now();
+  for (const [key, entry] of this.cache) {
+    if (entry.expiresAt <= now) this.cache.delete(key);
   }
 }
 ```
 
-In backend/src/controllers/filesController.js:
-- Import fetchWithTimeout at the top: import { fetchWithTimeout } from "../utils/fetchWithTimeout.js";
-- In getThumbnail(), replace: const response = await fetch(file.thumbnailLink);
-  With: const response = await fetchWithTimeout(file.thumbnailLink, {}, 5000);
-  (Remove the AbortController you added in FIX #2 since fetchWithTimeout handles it)
+---
 
-================================================================================
-FIX #16 — QUALITY: Remove hardcoded values from CORS config
-================================================================================
+### LOW-04 — `rel="noopener noreferrer"` Missing on External Links
 
-PROBLEM:
-- File: backend/src/index.js
-- Hardcoded local IP and production URL in CORS origins list
+**Files:** `frontend/components/files/PreviewModal.tsx`, `frontend/app/docs/page.tsx`
 
-SOLUTION:
-In backend/src/index.js, replace the allowedOrigins array with:
-```javascript
-const allowedOrigins = [
-  ...new Set(
-    [
-      "http://localhost:3000",
-      process.env.FRONTEND_URL,
-      ...(process.env.EXTRA_ALLOWED_ORIGINS
-        ? process.env.EXTRA_ALLOWED_ORIGINS.split(",").map((o) => o.trim())
-        : []),
-    ].filter(Boolean)
-  ),
-];
+**Problem:**  
+```tsx
+// PreviewModal.tsx — missing rel attribute
+<a href={`https://drive.google.com/file/d/${file.drive_file_id}/view`} target="_blank">
 ```
 
-Then in backend/.env add:
-  EXTRA_ALLOWED_ORIGINS=http://192.168.137.1:3000
+Without `rel="noopener noreferrer"`, the opened page can access `window.opener` and potentially redirect the original tab.
 
-And in production deployment, set FRONTEND_URL to your production domain.
-Remove the hardcoded "https://atifs-drive.vercel.app" from the code entirely.
+**Fix:**  
+Add to every `target="_blank"` link:
+```tsx
+<a href="..." target="_blank" rel="noopener noreferrer">Open in Drive</a>
+```
 
-================================================================================
-FIX #17 — QUALITY: Sanitize error messages in production
-================================================================================
+---
 
-PROBLEM:
-- File: backend/src/middlewares/errorHandler.js
-- Raw error messages (DB errors, stack traces) reach the client in production
+### LOW-05 — `docker-compose.yml` Context Path Mismatch
 
-SOLUTION:
-Replace backend/src/middlewares/errorHandler.js entirely with:
+**File:** `backend/docker-compose.yml`
+
+**Problem:**  
+The file is located at `backend/docker-compose.yml` but references `./backend` as the build context for the backend service. This only works if `docker-compose up` is run from the **parent** directory, which is non-standard placement.
+
+**Fix:**  
+Move `docker-compose.yml` to the project root:
+```
+/project-root/
+  docker-compose.yml      <- here
+  backend/
+  frontend/
+```
+
+Update contexts to `./backend` and `./frontend` respectively.
+
+---
+
+### LOW-06 — Incrementing Counter for Toast IDs Can Collide on Long Sessions
+
+**File:** `frontend/contexts/UploadContext.tsx`
+
+**Problem:**  
+```typescript
+const idRef = useRef(0);
+// ...
+const id = ++idRef.current; // Resets to 0 on component remount
+```
+
+If the `UploadProvider` remounts (e.g., during a hot reload or full-page navigation), the counter resets and ID collisions can cause toasts to not be properly removed.
+
+**Fix:**  
+Use `crypto.randomUUID()` or a module-level counter that doesn't reset:
+```typescript
+let _globalId = 0;
+const nextId = () => ++_globalId;
+```
+
+---
+
+### LOW-07 — Hardcoded External URLs in Multiple Components
+
+**Files:** `frontend/app/dashboard/settings/page.tsx`, `frontend/app/page.tsx`
+
+**Problem:**  
+```typescript
+href="https://github.com/Atifhasan250/Stitch-Drive"
+href="https://x.com/_atifhasan_"
+href="https://www.linkedin.com/in/atifhasan250/"
+```
+
+These are hardcoded in multiple places. If any URL changes, it requires finding and updating every occurrence.
+
+**Fix:**  
+Create a `lib/constants.ts` file:
+```typescript
+export const EXTERNAL_LINKS = {
+  github: "https://github.com/Atifhasan250/Stitch-Drive",
+  twitter: "https://x.com/_atifhasan_",
+  linkedin: "https://www.linkedin.com/in/atifhasan250/",
+} as const;
+```
+
+---
+
+### LOW-08 — No `robots.txt` or `sitemap.xml`
+
+**File:** `frontend/public/`
+
+**Problem:**  
+Without `robots.txt`, search engine crawlers will index all pages including auth pages and dashboard routes. This can cause user-facing dashboard URLs to appear in Google Search results.
+
+**Fix:**  
+Add `frontend/public/robots.txt`:
+```
+User-agent: *
+Disallow: /dashboard/
+Disallow: /api/
+Allow: /
+Allow: /docs
+Allow: /user-guide
+```
+
+---
+
+### LOW-09 — `useCallback` Missing on Several Event Handlers in Hot Paths
+
+**File:** `frontend/app/dashboard/files/page.tsx`
+
+**Problem:**  
+Functions like `handleRename`, `handleDelete`, `handleMove`, `handleShare` are recreated on every render of `FilesPage`, causing all child `GridCard` and `ListRow` components to re-render needlessly even when the file data hasn't changed.
+
+**Fix:**  
+Wrap these handlers in `useCallback`. The file-specific handlers should be moved into the child components themselves (already partially done in `FileCards.tsx`). Memoize `GridCard` and `ListRow` with `React.memo`.
+
+---
+
+### LOW-10 — Error Boundary Doesn't Report Errors
+
+**File:** `frontend/components/DashboardErrorBoundary.tsx`
+
+**Problem:**  
+The error boundary catches errors and shows a UI, which is good. But `componentDidCatch` only logs to the console — there's no error reporting to a monitoring service.
+
+**Fix:**  
+Integrate an error monitoring service (Sentry, LogRocket, etc.) in `componentDidCatch`:
+```typescript
+componentDidCatch(error: Error, info: React.ErrorInfo) {
+  // Replace with your error monitoring service
+  if (process.env.NODE_ENV === "production") {
+    // Sentry.captureException(error, { extra: info });
+  }
+  console.error("[ErrorBoundary]", error, info);
+}
+```
+
+---
+
+## 🟢 Performance Improvements
+
+---
+
+### PERF-01 — Full File List Fetched from Google on Every Sync
+
+**File:** `backend/src/services/driveService.js`
+
+**Problem:**  
+Every sync fetches all files from Google Drive regardless of what has changed:
 ```javascript
-import multer from "multer";
+q: "'me' in owners and trashed = false",
+pageSize: 1000, // Iterates through all pages
+```
 
-const IS_PROD = process.env.NODE_ENV === "production";
+For 10 accounts × 5,000 files each, this is 50,000+ records transferred per sync cycle. The sync also runs client-side every 30 minutes per tab.
 
-export function errorHandler(err, req, res, next) {
-  // Multer file size limit exceeded
-  if (err instanceof multer.MulterError) {
-    if (err.code === "LIMIT_FILE_SIZE") {
-      return res.status(413).json({ detail: "File too large. Maximum upload size is 500 MB." });
+**Fix:**  
+Use the Google Drive **Changes API** with a saved `nextPageToken` (called a "start page token"). This returns only changed files since the last sync:
+```javascript
+// Store startPageToken in DB per account
+// Use drive.changes.list({ pageToken: savedToken, fields: "newStartPageToken, changes" })
+// Update the token after each successful sync
+```
+
+This can reduce sync data transfer by 99% for users who rarely modify files.
+
+---
+
+### PERF-02 — `computeStats` Runs in `useEffect` Instead of `useMemo`
+
+**File:** `frontend/app/dashboard/page.tsx`, `frontend/app/dashboard/stats/page.tsx`
+
+**Problem:**  
+```typescript
+useEffect(() => {
+  const fresh = computeStats(files, accounts); // Called after every render
+  setCachedStats(fresh);
+  setStats(fresh);
+}, [files, accounts]);
+```
+
+Using `useEffect` + `setState` for derived data causes an extra render cycle: first render with stale stats, then re-render with fresh stats. This creates a flash of stale content.
+
+**Fix:**  
+```typescript
+const stats = useMemo(
+  () => (files.length || accounts.length) ? computeStats(files, accounts) : null,
+  [files, accounts]
+);
+```
+
+---
+
+### PERF-03 — 100 Individual `IntersectionObserver` Instances for Thumbnails
+
+**File:** `frontend/components/AuthenticatedThumbnail.tsx`
+
+**Problem:**  
+Each thumbnail component creates its own `IntersectionObserver` via an inline `ref` callback. With 100 files in grid view, 100 separate observers are created — each consuming memory and CPU.
+
+**Fix:**  
+Create a shared observer using a module-level singleton:
+```typescript
+// hooks/useIntersectionObserver.ts
+const callbacks = new WeakMap<Element, () => void>();
+const observer = new IntersectionObserver((entries) => {
+  entries.forEach(entry => {
+    if (entry.isIntersecting) {
+      callbacks.get(entry.target)?.();
     }
-    return res.status(400).json({ detail: `Upload error: ${err.message}` });
-  }
+  });
+}, { rootMargin: "100px" });
 
-  // CORS errors
-  if (err.message?.startsWith("CORS:")) {
-    return res.status(403).json({ detail: err.message });
-  }
-
-  // JWT / auth errors
-  if (err.name === "UnauthorizedError" || err.status === 401) {
-    return res.status(401).json({ detail: "Not authenticated" });
-  }
-
-  // Mongoose bad ObjectId cast
-  if (err.name === "CastError") {
-    return res.status(404).json({ detail: "Resource not found" });
-  }
-
-  // Mongoose validation errors — safe to expose
-  if (err.name === "ValidationError") {
-    return res.status(400).json({ detail: err.message });
-  }
-
-  const status = err.status || err.statusCode || 500;
-
-  // In production: hide internal 500 error details
-  // In development: expose full message for debugging
-  const detail = IS_PROD && status >= 500
-    ? "An internal error occurred. Please try again."
-    : (err.message || "Internal server error");
-
-  if (status >= 500) {
-    console.error("[Error]", {
-      method: req.method,
-      path: req.path,
-      status,
-      message: err.message,
-      stack: IS_PROD ? undefined : err.stack,
-    });
-  }
-
-  return res.status(status).json({ detail });
+export function observeElement(el: Element, callback: () => void) {
+  callbacks.set(el, callback);
+  observer.observe(el);
+  return () => { callbacks.delete(el); observer.unobserve(el); };
 }
 ```
 
-================================================================================
-FIX #18 — QUALITY: Add real health check endpoint
-================================================================================
+---
 
-PROBLEM:
-- File: backend/src/index.js
-- The /active endpoint doesn't check DB connectivity
+### PERF-04 — No HTTP Caching on File Listing API
 
-SOLUTION:
-In backend/src/index.js, replace:
+**File:** `backend/src/controllers/filesController.js`
+
+**Problem:**  
+The `GET /api/files` endpoint returns fresh data on every call with no caching headers. Every tab switch, navigation, and component mount triggers a full database query.
+
+**Fix:**  
+Add `ETag` headers based on a hash of the result set, or use short-term `Cache-Control`:
 ```javascript
-app.get("/active", (req, res) => res.json({ status: "active" }));
+// In listFiles controller:
+res.setHeader("Cache-Control", "private, max-age=30, stale-while-revalidate=60");
+res.setHeader("ETag", `"${hash(files)}"`);
 ```
 
-With:
+---
+
+### PERF-05 — MongoDB `bulkWrite` Without `ownerId` in Filter May Miss Index
+
+**File:** `backend/src/services/driveService.js`
+
+**Problem:**  
+The `reconcileAccountFiles` function filters without `ownerId`:
 ```javascript
-app.get("/health", async (req, res) => {
-  const dbState = mongoose.connection.readyState;
-  // readyState: 0=disconnected, 1=connected, 2=connecting, 3=disconnecting
-  const dbHealthy = dbState === 1;
-  const status = dbHealthy ? 200 : 503;
-  return res.status(status).json({
-    status: dbHealthy ? "healthy" : "degraded",
-    db: ["disconnected", "connected", "connecting", "disconnecting"][dbState] || "unknown",
-    uptime: Math.floor(process.uptime()),
-    timestamp: new Date().toISOString(),
-  });
+filter: { driveFileId: df.id, accountIndex: accountIndex }
+// Missing: ownerId!
+```
+
+The compound index is `{ ownerId: 1, driveFileId: 1, accountIndex: 1 }`. A filter without the leading `ownerId` field forces a collection scan instead of an index scan for large collections.
+
+**Fix:**  
+```javascript
+filter: { ownerId: ownerId, driveFileId: df.id, accountIndex: accountIndex }
+```
+
+---
+
+## 🏗️ Architecture & Design Improvements
+
+---
+
+### ARCH-01 — Frontend Directly Calls Google APIs (Wrong Architecture)
+
+**Problem:**  
+Three separate code paths call Google APIs directly from the browser:
+1. `useSync.ts` — lists all Drive files
+2. `lib/api.ts` (`fetchGoogleDriveBlob`) — downloads files
+3. `UploadContext.tsx` (`moveFile`) — uploads chunks to resumable upload sessions
+
+This makes it impossible to add server-side caching, centralized rate limiting, audit logging, or error recovery without complete rewrites.
+
+**Recommended Architecture:**  
+```
+Browser → Your Backend → Google Drive API
+```
+All Google API interactions should go through your backend. The backend handles token management, rate limiting, and error recovery transparently.
+
+---
+
+### ARCH-02 — Sync Should Be Server-Side, Not Browser-Driven
+
+**Problem:**  
+Sync only runs when a user has a browser tab open. If a user adds files to Drive via another app (Google Drive web, Android app, etc.) and never opens StitchDrive, their data never syncs. The sync also stops when all tabs are closed.
+
+**Fix:**  
+Implement a server-side cron job:
+```javascript
+// backend/src/jobs/syncJob.js
+import cron from "node-cron";
+import { syncFilesFromDrives } from "../services/driveService.js";
+import DriveAccount from "../models/DriveAccount.js";
+
+// Run sync for all users every hour
+cron.schedule("0 * * * *", async () => {
+  const owners = await DriveAccount.distinct("ownerId", { isConnected: true });
+  for (const ownerId of owners) {
+    await syncFilesFromDrives(ownerId).catch(console.error);
+  }
 });
-
-// Keep /active for backward compatibility
-app.get("/active", (req, res) => res.json({ status: "active" }));
 ```
 
-Also add this import at the top of index.js if not already present:
+---
+
+### ARCH-03 — No Audit Logging for Security-Critical Operations
+
+**Problem:**  
+Operations like connecting/disconnecting Google accounts, uploading credentials, and deleting credentials leave no audit trail. If an account is compromised, there's no forensic record.
+
+**Fix:**  
+Add an `AuditLog` model:
 ```javascript
-import mongoose from "mongoose";
+const auditLogSchema = new mongoose.Schema({
+  ownerId: { type: String, required: true, index: true },
+  action: { type: String, required: true }, // "connect_account", "delete_credentials", etc.
+  metadata: { type: mongoose.Schema.Types.Mixed },
+  ip: String,
+  userAgent: String,
+  timestamp: { type: Date, default: Date.now, index: true },
+});
+```
+Log every sensitive operation. Retain for 90 days minimum.
+
+---
+
+### ARCH-04 — No Retry Logic for Failed Sync Operations
+
+**File:** `backend/src/services/driveService.js`
+
+**Problem:**  
+```javascript
+await Promise.allSettled(accounts.map(async (account) => { ... }));
 ```
 
-================================================================================
-FIX #19 — QUALITY: Upgrade multer to v2
-================================================================================
+Errors during individual account syncs are silently swallowed. The user has no visibility into whether their Drive data is actually synced.
 
-PROBLEM:
-- File: backend/package.json
-- multer@1.4.5-lts.1 has known vulnerabilities (the package itself warns about this)
+**Fix:**  
+Track sync status per account in the database. Add a `lastSyncAt`, `lastSyncError`, and `syncStatus` field to `DriveAccount`. Implement retry with exponential backoff for transient errors (429, 503).
 
-SOLUTION:
-Run in backend/:
-  npm uninstall multer
-  npm install multer@2
+---
 
-Then in backend/src/routes/profile.js, verify the multer v2 API.
-The main API change in multer v2:
-- memoryStorage() works the same way
-- limits option works the same way
-- No API changes needed for your usage
+### ARCH-05 — Move Operation Has No Server-Side Representation
 
-Double-check by reading the multer v2 changelog before running.
-If there are breaking changes, update accordingly.
+**Problem:**  
+The "move file to another account" operation is entirely client-side JavaScript with no server record. If it fails partway through, neither the user nor the server knows the operation was attempted. Files can silently end up in inconsistent states.
 
-================================================================================
-ENVIRONMENT VARIABLE ADDITIONS SUMMARY
-================================================================================
+**Fix:**  
+Create a `Transfers` collection:
+```javascript
+const transferSchema = new mongoose.Schema({
+  ownerId: String,
+  sourceFileId: String, // MongoDB _id
+  sourceDriveFileId: String,
+  sourceAccountIndex: Number,
+  targetAccountIndex: Number,
+  targetDriveFileId: String,
+  status: { type: String, enum: ["pending", "downloading", "uploading", "deleting", "complete", "failed"] },
+  error: String,
+  createdAt: { type: Date, default: Date.now },
+  completedAt: Date,
+});
+```
+Expose a `POST /api/transfers` endpoint and handle the operation server-side.
 
-Add these to backend/.env and backend/.env.example:
-Security — generate with: node -e "console.log(require('crypto').randomBytes(32).toString('hex'))"
-STATE_SECRET=<your-generated-secret>
-Security — generate with: node -e "console.log(require('crypto').randomBytes(32).toString('base64'))"
-ENCRYPTION_KEY=<your-generated-32-byte-base64-key>
-CORS — comma-separated list of additional allowed origins
-EXTRA_ALLOWED_ORIGINS=http://192.168.137.1:3000
+---
 
-Remove from .env (no longer needed after FIX #4):
-  Any existing encryption_key stored in MongoDB (can be deleted from DB after deployment)
+### ARCH-06 — MongoDB Connection Has No Error Recovery Beyond Reconnect Logging
 
-================================================================================
-TESTING CHECKLIST — Verify each fix works before deploying
-================================================================================
+**File:** `backend/src/db/index.js`
 
-FIX #1 (Credentials):
-  [ ] Upload credentials.json via UI — verify it calls POST /api/credentials/store
-  [ ] Verify no localStorage.getItem("credentials") calls remain in frontend
-  [ ] Verify file operations work without X-Credentials header from frontend
-  [ ] Verify OAuth flow still works (connect a Google account)
-  [ ] Verify credentials status shows correctly on dashboard
+**Problem:**  
+The DB connection emits `disconnected` and `reconnected` events, but there's no handling of the interim state where requests arrive while MongoDB is reconnecting. These requests will fail with unhandled errors rather than returning a graceful 503.
 
-FIX #2 (SSRF):
-  [ ] Upload a file with a thumbnail — verify thumbnail loads
-  [ ] Manually test that a non-googleusercontent.com thumbnailLink returns 400
+**Fix:**  
+Add middleware to check DB state before processing API requests:
+```javascript
+app.use((req, res, next) => {
+  if (mongoose.connection.readyState !== 1) {
+    return res.status(503).json({ detail: "Database temporarily unavailable. Please retry." });
+  }
+  next();
+});
+```
 
-FIX #3 (OAuth State):
-  [ ] Set STATE_SECRET in .env
-  [ ] Connect a new Google Drive account — verify OAuth flow completes
-  [ ] Verify tampered state parameter returns oauth_invalid error
+---
 
-FIX #4 (Encryption Key):
-  [ ] Set ENCRYPTION_KEY in .env with a valid 32-byte base64 key
-  [ ] Restart backend — verify no startup errors
-  [ ] Verify existing connected accounts still work (re-auth if needed since
-      tokens were encrypted with the old key — existing tokens must be re-issued)
+## ✅ Quick Win Checklist
 
-FIX #5 (Memory Leak):
-  [ ] Open files page with many thumbnails
-  [ ] Navigate away and back — verify no memory growth in browser dev tools
+These fixes are each under 30 minutes and make an immediate impact:
 
-FIX #6 (Sync Interval):
-  [ ] Verify auto-sync fires every 5 minutes without resetting
+| # | Fix | File | Priority |
+|---|-----|------|----------|
+| 1 | Delete `frontend/test_clerk.js` | `test_clerk.js` | 🔴 Do Now |
+| 2 | Remove `X-Credentials` header support | `auth.js` | 🔴 Do Now |
+| 3 | Add `validateDriveId()` and apply everywhere | `driveService.js` | 🔴 Do Now |
+| 4 | Strip `err.response?.data` from OAuth error logs | `accountsController.js` | 🟠 This Week |
+| 5 | Add file size check before browser-side move | `UploadContext.tsx` | 🟠 This Week |
+| 6 | Add `rel="noopener noreferrer"` to all `target="_blank"` links | `PreviewModal.tsx`, others | 🟠 This Week |
+| 7 | Delete dead components (`UploadZone.tsx`, `StorageBar.tsx`, `FileList.tsx`, `AccountCard.tsx`) | Multiple | 🟡 Soon |
+| 8 | Replace fake OG URL with env variable | `layout.tsx` | 🟡 Soon |
+| 9 | Add graceful SIGTERM/SIGINT shutdown handler | `index.js` | 🟡 Soon |
+| 10 | Fix `docker-compose.yml` to project root | `backend/docker-compose.yml` | 🟡 Soon |
+| 11 | Add `robots.txt` to `public/` | `frontend/public/` | 🟡 Soon |
+| 12 | Replace incrementing counter with `crypto.randomUUID()` for IDs | `UploadContext.tsx` | 🔵 Later |
+| 13 | Add `ownerId` to `reconcileAccountFiles` filter | `driveService.js` | 🟠 This Week |
+| 14 | Add MongoDB readyState middleware guard | `index.js` | 🟡 Soon |
+| 15 | Move hardcoded external URLs to `lib/constants.ts` | Multiple | 🔵 Later |
 
-FIX #7 (Move Rollback):
-  [ ] Test moving a file between accounts with good network
-  [ ] Verify file appears on target and is removed from source
+---
 
-FIX #8 (Filename Validation):
-  [ ] Try renaming a file to "../../etc/passwd" — should get 400
-  [ ] Try renaming to a name > 255 chars — should get 400
-  [ ] Try renaming to "normal file.txt" — should succeed
+## Summary Table
 
-FIX #14 (Pagination):
-  [ ] Verify files still load on the files page
-  [ ] Check response headers include X-Total-Count
+| Category | Count | Recommended Timeline |
+|----------|-------|---------------------|
+| 🔴 Critical Security | 5 | Fix **before** any public deployment |
+| 🟠 High Severity | 7 | Fix **before** next release |
+| 🟡 Medium Severity | 9 | Fix within **2 sprints** |
+| 🔵 Low / Code Quality | 10 | Address in **regular maintenance** |
+| 🟢 Performance | 5 | Address after **stability is confirmed** |
+| 🏗️ Architecture | 6 | Plan for **future milestones** |
+| **Total** | **42** | |
 
-FIX #15 (Timeouts):
-  [ ] Verify thumbnails still load
-  [ ] Verify downloads still work
+---
 
-FIX #16 (CORS):
-  [ ] Verify EXTRA_ALLOWED_ORIGINS works in .env
-  [ ] Remove the hardcoded IP from code
-
-FIX #17 (Error Sanitization):
-  [ ] In production mode, trigger a 500 error — verify generic message shown
-  [ ] In development mode — verify full error message shown
-
-FIX #18 (Health Check):
-  [ ] GET /health with DB connected — verify 200 and "healthy"
-
-FIX #19 (Multer):
-  [ ] Test avatar upload still works after upgrade
-
-================================================================================
-IMPORTANT NOTES FOR AI AGENT
-================================================================================
-
-1. FIX #4 (ENCRYPTION_KEY) is a BREAKING CHANGE for existing deployments.
-   All refresh tokens stored in the DB were encrypted with the OLD key from MongoDB.
-   After deploying FIX #4, users will need to reconnect their Google accounts
-   because their stored refresh tokens cannot be decrypted with the new key.
-   Plan a migration window or re-encrypt existing tokens before switching.
-
-2. FIX #1 (Credentials) changes how EVERY request works in the frontend.
-   After implementing, test the complete user flow end-to-end before deploying.
-
-3. The order of fixes matters for FIX #1:
-   - Do backend steps (1-5) before frontend steps (6-10)
-   - The frontend must not call any credential endpoints that don't exist yet
-
-4. Do NOT modify the following files unless explicitly instructed in a fix:
-   - backend/src/models/DriveAccount.js
-   - backend/src/models/File.js
-   - backend/src/db/index.js
-   - frontend/app/layout.tsx
-   - frontend/middleware.ts
-   - Any test files
-
-5. After all fixes are applied, run:
-   - cd backend && npm install (for potential new dependencies)
-   - cd frontend && npm install (for potential new dependencies)
-   - Verify TypeScript compiles: cd frontend && npx tsc --noEmit
-
-END OF INSTRUCTIONS
+*This report was generated through manual static code analysis of the full frontend and backend codebase. Dynamic testing (penetration testing, fuzzing, load testing) would surface additional runtime issues not covered here.*

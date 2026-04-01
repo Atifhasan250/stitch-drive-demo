@@ -5,7 +5,6 @@ import { apiLimiter } from "../middlewares/rateLimiters.js";
 import { 
   listAccounts, 
   disconnectAccount, 
-  getAccessToken, 
   getNewOAuthUrl, 
   getOAuthUrl, 
   oauthCallback,
@@ -22,7 +21,6 @@ router.get("/oauth/:accountIndex", requireAuth, loginLimiter, getOAuthUrl);
 // Base account management
 router.use(requireAuth, apiLimiter);
 router.get("/", listAccounts);
-router.get("/:accountIndex/token", getAccessToken);
 router.post("/verify-credentials", verifyCredentialsService);
 router.delete("/:accountIndex", disconnectAccount);
 
